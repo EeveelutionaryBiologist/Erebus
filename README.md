@@ -1,2 +1,4 @@
 # Erebus
-LLM locally managed persistent memory system
+LLM locally managed persistent memory system.
+
+This will be populated soon.
