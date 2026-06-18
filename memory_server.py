@@ -30,7 +30,7 @@ CONSOLIDATION_PASSES = 2
 app = FastAPI(title="Nyxx Memory Microservice")
 
 BASE_DIR = Path(__file__).resolve().parent
-MEMORY_DIR = BASE_DIR / "Memory"
+MEMORY_DIR = BASE_DIR / "DB"
 CHROMA_PATH = MEMORY_DIR / "chromadb"
 SQLITE_PATH = MEMORY_DIR / "metadata.db"
 EMBEDDING_DIR = BASE_DIR / "Embedding"
