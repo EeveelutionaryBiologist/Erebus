@@ -71,7 +71,7 @@ def get_embedding(text: str) -> list[float]:
     return response["data"][0]["embedding"]
 
 # Initialize Knowledge Graph
-knowledge_graph = KnowledgeRelationshipGraph(str(MEMORY_DIR / "knowledge_graph.json"))
+knowledge_graph = KnowledgeRelationshipGraph(str(GRAPH_DIR / "knowledge_graph.json"))
 
 # ==========================================
 # 3. DATABASE INITIALIZATION
