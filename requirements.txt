@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pydantic
+chromadb
+llama-cpp-python
+huggingface_hub
+numpy
+networkx
