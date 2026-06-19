@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "requires_model: tests that need GGUF models on disk — skip with -m 'not requires_model'",
+    "integration: tests that hit real databases (SQLite, ChromaDB, KG on disk)",
+    "slow: tests that are expected to take more than a few seconds",
+]
