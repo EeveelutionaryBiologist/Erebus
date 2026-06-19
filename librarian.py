@@ -88,8 +88,10 @@ def process_memory_chunk(text: str) -> MemoryProcessing:
     system_prompt = (
         "You are an advanced data extraction AI. You have two tasks:\n"
         "1. Extract 'atomic_facts': Break the text into independent, single-fact sentences. "
-        "CRITICAL: Resolve all pronouns. 'She has cats' MUST become 'Hailey has cats'.\n"
-        "2. Extract 'triples': Create Subject-Predicate-Object relations for the knowledge graph."
+        "CRITICAL: Resolve all pronouns by finding the antecedent in the full text before writing each fact."
+        "Example input: 'Alice has a cat. She loves it.'"
+        "Example output atomic_facts: ['Alice has a cat.', 'Alice loves the cat.']"
+        "Never output a fact containing 'she', 'he', 'it', 'they', 'her', 'him', 'them'."
     )
     
     print(f"[LIBRARIAN] Processing chunk for DBs: '{text[:50]}...'")

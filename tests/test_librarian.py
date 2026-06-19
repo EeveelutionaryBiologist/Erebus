@@ -49,6 +49,7 @@ class TestProcessMemoryChunk:
         result = librarian.process_memory_chunk("Hailey has a cat. She loves it.")
         assert result is not None
         combined = " ".join(result.atomic_facts).lower()
+
         assert "she " not in combined and " he " not in combined
 
 
