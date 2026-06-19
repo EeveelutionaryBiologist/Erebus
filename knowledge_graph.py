@@ -1,3 +1,4 @@
+
 import json
 from pathlib import Path
 import networkx as nx
@@ -15,45 +16,32 @@ class KnowledgeRelationshipGraph:
         else:
             self.G = nx.DiGraph() 
 
-    def retrieve_relationships(self, node_name: str, depth: int = 1) -> list[str]:
-        """
-        Yields information pieces formatted for the LLM context.
-        Includes a case-insensitive fallback search.
-        """
-        target_node = node_name
-        
-        # Exact match first (fastest)
-        if not self.G.has_node(target_node):
-            # Fallback: case-insensitive search
-            lower_name = node_name.lower()
-            found = False
-            for existing_node in self.G.nodes():
-                if str(existing_node).lower() == lower_name:
-                    target_node = existing_node
-                    found = True
-                    break
-                    
-            if not found:
-                return []
+    def retrieve_relationships(self, node_id: str, depth: int = 1) -> list[str]:
+        """Returns edges within `depth` hops of `node_id` as human-readable strings."""
+        if not self.G.has_node(node_id):
+            return []
 
-        # ego_graph extracts the target node and all neighbors within the 'depth' radius
-        subgraph = nx.ego_graph(self.G, target_node, radius=depth, undirected=False)
-        
-        extracted_facts = []
+        subgraph = nx.ego_graph(self.G, node_id, radius=depth, undirected=False)
+
+        facts = []
         for source, target, data in subgraph.edges(data=True):
+            src_name = self.G.nodes[source].get('name', source)
+            tgt_name = self.G.nodes[target].get('name', target)
             predicate = data.get('relation', 'RELATES_TO')
-            extracted_facts.append(f"{source} [{predicate}] {target}")
-            
-        return extracted_facts
+            facts.append(f"{src_name} [{predicate}] {tgt_name}")
 
-    def add_relationship(self, subject: str, predicate: str, object_: str, fact_ids: list[str] | None = None):
-        self.G.add_node(subject)
-        self.G.add_node(object_)
+        return facts
 
-        if self.G.has_edge(subject, object_):
-            # Edge already exists — append new fact_ids to the existing source list.
-            # Predicate is left unchanged (first writer wins).
-            edge_data = self.G[subject][object_]
+    def add_relationship(self, subject_id: str, predicate: str, object_id: str,
+                         subject_name: str, object_name: str,
+                         fact_ids: list[str] | None = None):
+        """Adds or updates a directed edge between two entity UUID nodes."""
+        self.G.add_node(subject_id, name=subject_name)
+        self.G.add_node(object_id, name=object_name)
+
+        if self.G.has_edge(subject_id, object_id):
+            # Edge already exists — append new fact_ids. Predicate is left unchanged (first writer wins).
+            edge_data = self.G[subject_id][object_id]
             if fact_ids:
                 existing = edge_data.get('source_fact_ids', [])
                 for fid in fact_ids:
@@ -62,11 +50,23 @@ class KnowledgeRelationshipGraph:
                 edge_data['source_fact_ids'] = existing
         else:
             self.G.add_edge(
-                subject, object_,
+                subject_id, object_id,
                 relation=predicate,
                 source_fact_ids=list(fact_ids) if fact_ids else []
             )
 
+        self.write_graph()
+
+    def rebuild_with_name_to_id_mapping(self, name_to_id: dict[str, str]) -> None:
+        """Replaces string node keys with UUID keys. Used for v2 schema migration."""
+        new_G = nx.DiGraph()
+        for name, uid in name_to_id.items():
+            new_G.add_node(uid, name=name)
+        for source, target, data in self.G.edges(data=True):
+            src_id = name_to_id[str(source)]
+            tgt_id = name_to_id[str(target)]
+            new_G.add_edge(src_id, tgt_id, **data)
+        self.G = new_G
         self.write_graph()
 
     def remove_fact_reference(self, fact_id: str) -> int:
@@ -101,17 +101,14 @@ class KnowledgeRelationshipGraph:
 
         return len(edges_to_remove)
 
-    def remove_relationship(self, subject: str, object_: str):
-        """Removes an edge, and cleans up orphaned nodes if they are left floating."""
-        if self.G.has_edge(subject, object_):
-            self.G.remove_edge(subject, object_)
-            
-            # If nodes have 0 connections left after edge removal, delete them
-            if self.G.degree(subject) == 0:
-                self.G.remove_node(subject)
-            if self.G.degree(object_) == 0:
-                self.G.remove_node(object_)
-            
+    def remove_relationship(self, subject_id: str, object_id: str):
+        """Removes an edge by entity UUIDs and cleans up orphaned nodes."""
+        if self.G.has_edge(subject_id, object_id):
+            self.G.remove_edge(subject_id, object_id)
+            if self.G.degree(subject_id) == 0:
+                self.G.remove_node(subject_id)
+            if self.G.degree(object_id) == 0:
+                self.G.remove_node(object_id)
             self.write_graph()
 
     def write_graph(self):
@@ -120,9 +117,11 @@ class KnowledgeRelationshipGraph:
             json.dump(data, outfile, indent=4)
             
     def dump_all_facts(self) -> list[str]:
-        """Utility function to view the entire knowledge base."""
+        """Utility: returns all graph edges as human-readable strings."""
         facts = []
         for source, target, data in self.G.edges(data=True):
+            src_name = self.G.nodes[source].get('name', source)
+            tgt_name = self.G.nodes[target].get('name', target)
             predicate = data.get('relation', 'RELATES_TO')
-            facts.append(f"{source} [{predicate}] {target}")
+            facts.append(f"{src_name} [{predicate}] {tgt_name}")
         return facts

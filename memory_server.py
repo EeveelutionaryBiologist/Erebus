@@ -1,4 +1,5 @@
-import os
+import re
+import json
 import uuid
 import sqlite3
 from datetime import datetime, timedelta
@@ -64,7 +65,7 @@ def startup_event():
     
     # Load background Librarian
     load_librarian_model()
-    _backfill_record_types()
+    _migrate_to_v2()
 
 def get_embedding(text: str) -> list[float]:
     response = embedder.create_embedding(text)
@@ -77,56 +78,120 @@ knowledge_graph = KnowledgeRelationshipGraph(str(GRAPH_DIR / "knowledge_graph.js
 # 3. DATABASE INITIALIZATION
 # ==========================================
 def init_sqlite():
-    # check_same_thread=False is critical to prevent FastAPI threading crashes
     conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS memories (
-            id TEXT PRIMARY KEY,
-            content TEXT,
-            hit_count INTEGER DEFAULT 0,
-            created_at DATETIME,
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS raw_chunks (
+            id          TEXT PRIMARY KEY,
+            content     TEXT NOT NULL,
+            created_at  DATETIME,
             last_accessed DATETIME
-        )
-    ''')
+        );
+        CREATE TABLE IF NOT EXISTS atomic_facts (
+            id          TEXT PRIMARY KEY,
+            content     TEXT NOT NULL,
+            hit_count   INTEGER DEFAULT 0,
+            created_at  DATETIME,
+            last_accessed DATETIME
+        );
+        CREATE TABLE IF NOT EXISTS entities (
+            id             TEXT PRIMARY KEY,
+            canonical_name TEXT NOT NULL,
+            aliases        TEXT DEFAULT '[]',
+            hit_count      INTEGER DEFAULT 0,
+            created_at     DATETIME,
+            last_accessed  DATETIME
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_name_ci
+            ON entities(LOWER(canonical_name));
+    """)
     conn.commit()
-
-    # Migration: add record_type column if this is an existing database
-    try:
-        cursor.execute("ALTER TABLE memories ADD COLUMN record_type TEXT DEFAULT 'fact'")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
     return conn
 
 sqlite_conn = init_sqlite()
 chroma_client = chromadb.PersistentClient(path=str(CHROMA_PATH))
 collection = chroma_client.get_or_create_collection(name="nyxx_memory")
 
-def _backfill_record_types():
-    """
-    One-time migration for databases created before the record_type column existed.
-    Any SQLite record whose ID is not in ChromaDB is a raw chunk — tag it 'raw'.
-    Runs at startup; safe to call multiple times (no-op if already tagged).
-    """
+_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+)
+
+def _is_uuid(s: str) -> bool:
+    return bool(_UUID_RE.match(s.lower()))
+
+def _migrate_kg_nodes(cursor):
+    """Creates entity rows for legacy string-keyed KG nodes and rebuilds the graph with UUID keys."""
+    now = datetime.now().isoformat()
+    name_to_id: dict[str, str] = {}
+
+    for raw_name in list(knowledge_graph.G.nodes()):
+        name_str = str(raw_name)
+        # Use get-or-create so case-variants collapse to one entity.
+        cursor.execute("SELECT id FROM entities WHERE LOWER(canonical_name) = LOWER(?)", (name_str,))
+        row = cursor.fetchone()
+        if row:
+            name_to_id[name_str] = row[0]
+        else:
+            entity_id = str(uuid.uuid4())
+            cursor.execute(
+                "INSERT INTO entities (id, canonical_name, aliases, hit_count, created_at, last_accessed) "
+                "VALUES (?, ?, '[]', 0, ?, ?)",
+                (entity_id, name_str, now, now)
+            )
+            name_to_id[name_str] = entity_id
+
+    knowledge_graph.rebuild_with_name_to_id_mapping(name_to_id)
+    print(f"[SYSTEM] KG migrated: {len(name_to_id)} nodes converted to UUID keys.")
+
+def _migrate_to_v2():
+    """Migrates the legacy unified 'memories' table to the three-table v2 schema."""
     cursor = sqlite_conn.cursor()
-    cursor.execute("SELECT id FROM memories WHERE record_type = 'fact' OR record_type IS NULL")
-    candidates = [row[0] for row in cursor.fetchall()]
-    if not candidates:
-        return
 
-    chroma_data = collection.get(include=[])
-    chroma_ids = set(chroma_data["ids"])
-
-    sqlite_only = [id_ for id_ in candidates if id_ not in chroma_ids]
-    if sqlite_only:
-        cursor.execute(
-            f"UPDATE memories SET record_type='raw' WHERE id IN ({','.join('?' * len(sqlite_only))})",
-            sqlite_only
-        )
+    # Migrate legacy data if the old table still exists.
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='memories'")
+    if cursor.fetchone():
+        print("[SYSTEM] Migrating legacy 'memories' table to v2 schema...")
+        cursor.execute("""
+            INSERT OR IGNORE INTO raw_chunks (id, content, created_at, last_accessed)
+            SELECT id, content, created_at, last_accessed FROM memories WHERE record_type = 'raw'
+        """)
+        cursor.execute("""
+            INSERT OR IGNORE INTO atomic_facts (id, content, hit_count, created_at, last_accessed)
+            SELECT id, content, hit_count, created_at, last_accessed FROM memories WHERE record_type = 'fact'
+        """)
+        cursor.execute("DROP TABLE memories")
         sqlite_conn.commit()
-        print(f"[SYSTEM] Backfilled {len(sqlite_only)} existing records as record_type='raw'.")
+        print("[SYSTEM] Legacy 'memories' table migrated and dropped.")
+
+    # Migrate KG nodes if any are still string-keyed (not UUIDs).
+    nodes = list(knowledge_graph.G.nodes())
+    if nodes and not all(_is_uuid(str(n)) for n in nodes):
+        _migrate_kg_nodes(cursor)
+        sqlite_conn.commit()
+
+def get_or_create_entity(name: str) -> str:
+    """Returns the entity UUID for `name`, inserting a new row if it doesn't exist."""
+    cursor = sqlite_conn.cursor()
+    cursor.execute("SELECT id FROM entities WHERE LOWER(canonical_name) = LOWER(?)", (name,))
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+    entity_id = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    cursor.execute(
+        "INSERT INTO entities (id, canonical_name, aliases, hit_count, created_at, last_accessed) "
+        "VALUES (?, ?, '[]', 0, ?, ?)",
+        (entity_id, name, now, now)
+    )
+    sqlite_conn.commit()
+    return entity_id
+
+def lookup_entity(name: str) -> str | None:
+    """Returns the entity UUID for `name` (case-insensitive), or None if not found."""
+    cursor = sqlite_conn.cursor()
+    cursor.execute("SELECT id FROM entities WHERE LOWER(canonical_name) = LOWER(?)", (name,))
+    row = cursor.fetchone()
+    return row[0] if row else None
 
 # ==========================================
 # 4. CONSOLIDATION CONFIGURATION
@@ -170,8 +235,8 @@ def add_memory(memory: MemoryInput):
     # 2. Store original raw chunk in SQLite (provenance record, not indexed in ChromaDB)
     raw_id = str(uuid.uuid4())
     cursor.execute(
-        "INSERT INTO memories (id, content, created_at, last_accessed, record_type) VALUES (?, ?, ?, ?, ?)",
-        (raw_id, memory.text, now, now, 'raw')
+        "INSERT INTO raw_chunks (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
+        (raw_id, memory.text, now, now)
     )
     sqlite_conn.commit()
 
@@ -184,15 +249,18 @@ def add_memory(memory: MemoryInput):
 
         collection.add(embeddings=[vector], documents=[fact], ids=[fact_id])
         cursor.execute(
-            "INSERT INTO memories (id, content, created_at, last_accessed, record_type) VALUES (?, ?, ?, ?, ?)",
-            (fact_id, fact, now, now, 'fact')
+            "INSERT INTO atomic_facts (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
+            (fact_id, fact, now, now)
         )
     sqlite_conn.commit()
 
     # 4. Save Triples to Knowledge Graph, linked to this batch's fact IDs
     for triple in processed_data.triples:
+        subject_id = get_or_create_entity(triple.subject)
+        object_id  = get_or_create_entity(triple.object)
         knowledge_graph.add_relationship(
-            triple.subject, triple.predicate, triple.object,
+            subject_id, triple.predicate, object_id,
+            subject_name=triple.subject, object_name=triple.object,
             fact_ids=fact_ids_batch
         )
         print(f"  -> Graph Mapped: {triple.subject} [{triple.predicate}] {triple.object}")
@@ -218,30 +286,33 @@ def search_memory(search: SearchQuery):
     final_results = []
     if results['ids'] and results['ids'][0]:
         for mem_id in results['ids'][0]:
-            cursor.execute("""
-                UPDATE memories 
-                SET hit_count = hit_count + 1, last_accessed = ? 
-                WHERE id = ?
-            """, (now, mem_id))
-            sqlite_conn.commit()
-            
-            cursor.execute("SELECT content, hit_count FROM memories WHERE id = ?", (mem_id,))
+            cursor.execute(
+                "UPDATE atomic_facts SET hit_count = hit_count + 1, last_accessed = ? WHERE id = ?",
+                (now, mem_id)
+            )
+            cursor.execute("SELECT content, hit_count FROM atomic_facts WHERE id = ?", (mem_id,))
             row = cursor.fetchone()
             if row:
-                final_results.append({
-                    "text": row[0],
-                    "hit_count": row[1]
-                })
+                final_results.append({"text": row[0], "hit_count": row[1]})
+    sqlite_conn.commit()
 
     # --- 2. GRAPH RETRIEVAL ---
-    relation_facts = [] # Initialize safely
+    relation_facts = []
     extracted = extract_entities_from_text(search.query)
-    
+
     if extracted and hasattr(extracted, 'entities'):
         for entity in extracted.entities:
-            facts = knowledge_graph.retrieve_relationships(entity.name, depth=1)
+            entity_id = lookup_entity(entity.name)
+            if not entity_id:
+                continue
+            facts = knowledge_graph.retrieve_relationships(entity_id, depth=1)
             if facts:
                 relation_facts.extend(facts)
+                cursor.execute(
+                    "UPDATE entities SET hit_count = hit_count + 1, last_accessed = ? WHERE id = ?",
+                    (now, entity_id)
+                )
+    sqlite_conn.commit()
     
     summarized_context = ""
     if relation_facts:
@@ -256,18 +327,29 @@ def search_memory(search: SearchQuery):
 
 @app.get("/memory/all")
 def get_all_memories():
-    """Retrieves all memories currently stored in the SQLite database."""
+    """Retrieves all records from all three tables in a unified flat list."""
     cursor = sqlite_conn.cursor()
-    cursor.execute("SELECT id, content, hit_count, created_at, record_type FROM memories ORDER BY created_at DESC")
-    rows = cursor.fetchall()
-    return {"results": [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": r[4]} for r in rows]}
+    results = []
+
+    cursor.execute("SELECT id, content, 0, created_at FROM raw_chunks ORDER BY created_at DESC")
+    results += [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": "raw"} for r in cursor.fetchall()]
+
+    cursor.execute("SELECT id, content, hit_count, created_at FROM atomic_facts ORDER BY created_at DESC")
+    results += [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": "fact"} for r in cursor.fetchall()]
+
+    cursor.execute("SELECT id, canonical_name, hit_count, created_at FROM entities ORDER BY created_at DESC")
+    results += [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": "entity"} for r in cursor.fetchall()]
+
+    return {"results": results}
 
 @app.delete("/memory/clear")
 def clear_all_memories():
     """Wipes ChromaDB, SQLite, and the Knowledge Graph completely."""
     # 1. Clear SQLite
     cursor = sqlite_conn.cursor()
-    cursor.execute("DELETE FROM memories")
+    cursor.execute("DELETE FROM raw_chunks")
+    cursor.execute("DELETE FROM atomic_facts")
+    cursor.execute("DELETE FROM entities")
     sqlite_conn.commit()
     
     # 2. Clear ChromaDB
@@ -303,66 +385,48 @@ def consolidate_memories():
 
     for _N in range(CONSOLIDATION_PASSES):
         # ------------------------------------------------------------------
-        # Phase 0: Exact-text dedup across SQLite
+        # Phase 0: Exact-text dedup within atomic_facts
         # ------------------------------------------------------------------
-        # Uses record_type to distinguish atomic facts (in ChromaDB) from raw chunks
-        # (SQLite-only). Prefers keeping the 'fact' record; drops raw-chunk duplicates
-        # and any extra fact copies.
-        print("[CONSOLIDATE] Phase 0: Exact-text dedup in SQLite...")
+        print("[CONSOLIDATE] Phase 0: Exact-text dedup in atomic_facts...")
 
         cursor.execute("""
-            SELECT content, id, COALESCE(record_type, 'fact') as rt, hit_count
-            FROM memories
+            SELECT content, id, hit_count
+            FROM atomic_facts
             WHERE content IN (
-                SELECT content FROM memories GROUP BY content HAVING COUNT(*) > 1
+                SELECT content FROM atomic_facts GROUP BY content HAVING COUNT(*) > 1
             )
             ORDER BY content
         """)
         content_groups: dict[str, list] = {}
-        for content, id_, rt, hits in cursor.fetchall():
-            content_groups.setdefault(content, []).append((id_, rt, hits))
+        for content, id_, hits in cursor.fetchall():
+            content_groups.setdefault(content, []).append((id_, hits))
 
         for content, entries in content_groups.items():
-            facts = [(id_, hits) for id_, rt, hits in entries if rt == 'fact']
-            raws  = [id_ for id_, rt, hits in entries if rt != 'fact']
+            sorted_entries = sorted(entries, key=lambda x: x[1], reverse=True)
+            drop_fact_ids  = [e[0] for e in sorted_entries[1:]]
 
-            if facts:
-                facts_sorted = sorted(facts, key=lambda x: x[1], reverse=True)
-                keep_id       = facts_sorted[0][0]
-                drop_fact_ids = [e[0] for e in facts_sorted[1:]]
-                drop_ids      = drop_fact_ids + raws
-            else:
-                all_sorted    = sorted(entries, key=lambda x: x[2], reverse=True)
-                keep_id       = all_sorted[0][0]
-                drop_ids      = [e[0] for e in all_sorted[1:]]
-                drop_fact_ids = []
-
-            if not drop_ids:
+            if not drop_fact_ids:
                 continue
 
-            if drop_fact_ids:
-                collection.delete(ids=drop_fact_ids)
-                for cid in drop_fact_ids:
-                    knowledge_graph.remove_fact_reference(cid)
-
+            collection.delete(ids=drop_fact_ids)
+            for cid in drop_fact_ids:
+                knowledge_graph.remove_fact_reference(cid)
             cursor.execute(
-                f"DELETE FROM memories WHERE id IN ({','.join('?' * len(drop_ids))})",
-                drop_ids
+                f"DELETE FROM atomic_facts WHERE id IN ({','.join('?' * len(drop_fact_ids))})",
+                drop_fact_ids
             )
             sqlite_conn.commit()
-            report["merged"] += len(drop_ids)
-            print(f"[CONSOLIDATE] Exact-text dedup: dropped {len(drop_ids)} copy/copies of '{content[:60]}'")
+            report["merged"] += len(drop_fact_ids)
+            print(f"[CONSOLIDATE] Exact-text dedup: dropped {len(drop_fact_ids)} copy/copies of '{content[:60]}'")
 
         # ------------------------------------------------------------------
         # Phase 1: Prune stale atomic facts (never retrieved, older than N days)
         # ------------------------------------------------------------------
-        # record_type='fact' targets only ChromaDB-backed entries; raw chunks are
-        # excluded since their hit_count is always 0 but they should not be pruned.
         print("[CONSOLIDATE] Phase 1: Pruning stale memories...")
 
         cutoff = (datetime.now() - timedelta(days=PRUNE_AGE_DAYS)).isoformat()
         cursor.execute(
-            "SELECT id FROM memories WHERE hit_count = 0 AND created_at < ? AND record_type = 'fact'",
+            "SELECT id FROM atomic_facts WHERE hit_count = 0 AND created_at < ?",
             (cutoff,)
         )
         stale_fact_ids = [row[0] for row in cursor.fetchall()]
@@ -370,7 +434,7 @@ def consolidate_memories():
         if stale_fact_ids:
             collection.delete(ids=stale_fact_ids)
             cursor.execute(
-                f"DELETE FROM memories WHERE id IN ({','.join('?' * len(stale_fact_ids))})",
+                f"DELETE FROM atomic_facts WHERE id IN ({','.join('?' * len(stale_fact_ids))})",
                 stale_fact_ids
             )
             sqlite_conn.commit()
@@ -412,16 +476,16 @@ def consolidate_memories():
                     if sim >= HIGH_SIM_DEDUP_THRESHOLD:
                         # Near-identical text — Librarian would likely return an empty merged_fact
                         # for two identical strings. Skip it; just drop the lower-hit copy.
-                        cursor.execute("SELECT hit_count FROM memories WHERE id = ?", (ids[i],))
+                        cursor.execute("SELECT hit_count FROM atomic_facts WHERE id = ?", (ids[i],))
                         row_i = cursor.fetchone()
-                        cursor.execute("SELECT hit_count FROM memories WHERE id = ?", (ids[j],))
+                        cursor.execute("SELECT hit_count FROM atomic_facts WHERE id = ?", (ids[j],))
                         row_j = cursor.fetchone()
                         hits_i = row_i[0] if row_i else 0
                         hits_j = row_j[0] if row_j else 0
 
                         drop_id = ids[j] if hits_i >= hits_j else ids[i]
                         collection.delete(ids=[drop_id])
-                        cursor.execute("DELETE FROM memories WHERE id = ?", (drop_id,))
+                        cursor.execute("DELETE FROM atomic_facts WHERE id = ?", (drop_id,))
                         sqlite_conn.commit()
                         knowledge_graph.remove_fact_reference(drop_id)
 
@@ -438,12 +502,12 @@ def consolidate_memories():
 
                     # Remove both originals
                     collection.delete(ids=[ids[i], ids[j]])
-                    cursor.execute("DELETE FROM memories WHERE id IN (?, ?)", (ids[i], ids[j]))
+                    cursor.execute("DELETE FROM atomic_facts WHERE id IN (?, ?)", (ids[i], ids[j]))
                     sqlite_conn.commit()
                     knowledge_graph.remove_fact_reference(ids[i])
                     knowledge_graph.remove_fact_reference(ids[j])
 
-                    # Add merged fact (tagged as 'fact' so it's included in future dedup passes)
+                    # Add merged fact
                     merged_id = str(uuid.uuid4())
                     merged_vec = get_embedding(decision.merged_fact)
                     collection.add(
@@ -452,8 +516,8 @@ def consolidate_memories():
                         ids=[merged_id]
                     )
                     cursor.execute(
-                        "INSERT INTO memories (id, content, created_at, last_accessed, record_type) VALUES (?, ?, ?, ?, ?)",
-                        (merged_id, decision.merged_fact, now, now, 'fact')
+                        "INSERT INTO atomic_facts (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
+                        (merged_id, decision.merged_fact, now, now)
                     )
                     sqlite_conn.commit()
 
@@ -487,7 +551,7 @@ def consolidate_memories():
                 continue
 
             collection.delete(ids=[fact_id])
-            cursor.execute("DELETE FROM memories WHERE id = ?", (fact_id,))
+            cursor.execute("DELETE FROM atomic_facts WHERE id = ?", (fact_id,))
             knowledge_graph.remove_fact_reference(fact_id)
 
             for split_fact in decision.split_facts:
@@ -495,8 +559,8 @@ def consolidate_memories():
                 split_vec = get_embedding(split_fact)
                 collection.add(embeddings=[split_vec], documents=[split_fact], ids=[split_id])
                 cursor.execute(
-                    "INSERT INTO memories (id, content, created_at, last_accessed, record_type) VALUES (?, ?, ?, ?, ?)",
-                    (split_id, split_fact, now, now, 'fact')
+                    "INSERT INTO atomic_facts (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
+                    (split_id, split_fact, now, now)
                 )
 
             sqlite_conn.commit()
