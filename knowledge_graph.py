@@ -6,18 +6,49 @@ from networkx.readwrite import json_graph
 
 
 class KnowledgeRelationshipGraph:
-    def __init__(self, filepath):
+    """
+    Directed multi-graph of entity relationships backed by a JSON file.
+
+    Node keys are entity UUIDs; human-readable names are stored as node attributes.
+    Each edge carries a 'relation' string and a 'source_fact_ids' list so that
+    fact deletions can propagate without a full edge scan.
+
+    _fact_edge_index is a derived, in-memory acceleration structure:
+        fact_id → [(subject_id, object_id, edge_key), ...]
+    Invariant: it must always equal the union of source_fact_ids across all edges.
+    Every method that mutates edge source lists must keep the index in sync.
+    """
+
+    def __init__(self, filepath: str):
         self.filepath = filepath
-        # Load the previously stored graph as a Json
         if Path(filepath).exists():
             with open(filepath, 'r') as f:
                 data = json.load(f)
                 self.G = json_graph.node_link_graph(data)
+            # Transparently upgrade legacy DiGraph saves to MultiDiGraph.
+            if not isinstance(self.G, nx.MultiDiGraph):
+                self.G = nx.MultiDiGraph(self.G)
         else:
-            self.G = nx.DiGraph() 
+            self.G = nx.MultiDiGraph()
+        self._fact_edge_index: dict[str, list[tuple[str, str, int]]] = self._build_fact_edge_index()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_fact_edge_index(self) -> dict[str, list[tuple[str, str, int]]]:
+        index: dict[str, list[tuple[str, str, int]]] = {}
+        for s, t, k, data in self.G.edges(data=True, keys=True):
+            for fid in data.get('source_fact_ids', []):
+                index.setdefault(fid, []).append((s, t, k))
+        return index
+
+    # ------------------------------------------------------------------
+    # Read
+    # ------------------------------------------------------------------
 
     def retrieve_relationships(self, node_id: str, depth: int = 1) -> list[str]:
-        """Returns edges within `depth` hops of `node_id` as human-readable strings."""
+        """Returns all edges within `depth` hops of `node_id` as human-readable strings."""
         if not self.G.has_node(node_id):
             return []
 
@@ -32,92 +63,8 @@ class KnowledgeRelationshipGraph:
 
         return facts
 
-    def add_relationship(self, subject_id: str, predicate: str, object_id: str,
-                         subject_name: str, object_name: str,
-                         fact_ids: list[str] | None = None):
-        """Adds or updates a directed edge between two entity UUID nodes."""
-        self.G.add_node(subject_id, name=subject_name)
-        self.G.add_node(object_id, name=object_name)
-
-        if self.G.has_edge(subject_id, object_id):
-            # Edge already exists — append new fact_ids. Predicate is left unchanged (first writer wins).
-            edge_data = self.G[subject_id][object_id]
-            if fact_ids:
-                existing = edge_data.get('source_fact_ids', [])
-                for fid in fact_ids:
-                    if fid not in existing:
-                        existing.append(fid)
-                edge_data['source_fact_ids'] = existing
-        else:
-            self.G.add_edge(
-                subject_id, object_id,
-                relation=predicate,
-                source_fact_ids=list(fact_ids) if fact_ids else []
-            )
-
-        self.write_graph()
-
-    def rebuild_with_name_to_id_mapping(self, name_to_id: dict[str, str]) -> None:
-        """Replaces string node keys with UUID keys. Used for v2 schema migration."""
-        new_G = nx.DiGraph()
-        for name, uid in name_to_id.items():
-            new_G.add_node(uid, name=name)
-        for source, target, data in self.G.edges(data=True):
-            src_id = name_to_id[str(source)]
-            tgt_id = name_to_id[str(target)]
-            new_G.add_edge(src_id, tgt_id, **data)
-        self.G = new_G
-        self.write_graph()
-
-    def remove_fact_reference(self, fact_id: str) -> int:
-        """
-        Removes fact_id from the source list of every edge that references it.
-        Edges whose source_fact_ids list becomes empty are deleted, and any nodes
-        that become isolated are removed. Returns the number of edges deleted.
-
-        Legacy edges (written before source tracking was added) have no
-        source_fact_ids attribute and are left untouched — they're cleaned up by
-        the degree=0 orphan sweep in the consolidation routine.
-        """
-        for _, _, data in self.G.edges(data=True):
-            source_ids = data.get('source_fact_ids')
-            if source_ids and fact_id in source_ids:
-                source_ids.remove(fact_id)
-
-        edges_to_remove = [
-            (s, t) for s, t, d in self.G.edges(data=True)
-            if d.get('source_fact_ids') == []
-        ]
-
-        for source, target in edges_to_remove:
-            self.G.remove_edge(source, target)
-            if self.G.degree(source) == 0:
-                self.G.remove_node(source)
-            if self.G.degree(target) == 0:
-                self.G.remove_node(target)
-
-        if edges_to_remove:
-            self.write_graph()
-
-        return len(edges_to_remove)
-
-    def remove_relationship(self, subject_id: str, object_id: str):
-        """Removes an edge by entity UUIDs and cleans up orphaned nodes."""
-        if self.G.has_edge(subject_id, object_id):
-            self.G.remove_edge(subject_id, object_id)
-            if self.G.degree(subject_id) == 0:
-                self.G.remove_node(subject_id)
-            if self.G.degree(object_id) == 0:
-                self.G.remove_node(object_id)
-            self.write_graph()
-
-    def write_graph(self):
-        with open(self.filepath, 'w') as outfile:
-            data = json_graph.node_link_data(self.G)
-            json.dump(data, outfile, indent=4)
-            
     def dump_all_facts(self) -> list[str]:
-        """Utility: returns all graph edges as human-readable strings."""
+        """Returns all graph edges as human-readable strings."""
         facts = []
         for source, target, data in self.G.edges(data=True):
             src_name = self.G.nodes[source].get('name', source)
@@ -125,3 +72,134 @@ class KnowledgeRelationshipGraph:
             predicate = data.get('relation', 'RELATES_TO')
             facts.append(f"{src_name} [{predicate}] {tgt_name}")
         return facts
+
+    # ------------------------------------------------------------------
+    # Write
+    # ------------------------------------------------------------------
+
+    def add_relationship(self, subject_id: str, predicate: str, object_id: str,
+                         subject_name: str, object_name: str,
+                         fact_ids: list[str] | None = None):
+        """Adds or updates a directed edge between two entity UUID nodes.
+
+        If an edge with the same predicate already exists between this pair, the
+        new fact_ids are appended to it (preserving the existing relationship).
+        A genuinely different predicate gets its own edge (MultiDiGraph behaviour).
+        """
+        self.G.add_node(subject_id, name=subject_name)
+        self.G.add_node(object_id, name=object_name)
+
+        # Look for an existing edge with the same predicate.
+        existing_key = None
+        if self.G.has_edge(subject_id, object_id):
+            for k, data in self.G[subject_id][object_id].items():
+                if data.get('relation') == predicate:
+                    existing_key = k
+                    break
+
+        if existing_key is not None:
+            edge_data = self.G[subject_id][object_id][existing_key]
+            if fact_ids:
+                existing = edge_data.setdefault('source_fact_ids', [])
+                for fid in fact_ids:
+                    if fid not in existing:
+                        existing.append(fid)
+                        self._fact_edge_index.setdefault(fid, []).append(
+                            (subject_id, object_id, existing_key)
+                        )
+        else:
+            new_key = self.G.add_edge(
+                subject_id, object_id,
+                relation=predicate,
+                source_fact_ids=list(fact_ids) if fact_ids else []
+            )
+            if fact_ids:
+                for fid in fact_ids:
+                    self._fact_edge_index.setdefault(fid, []).append(
+                        (subject_id, object_id, new_key)
+                    )
+
+        self.write_graph()
+
+    def rebuild_with_name_to_id_mapping(self, name_to_id: dict[str, str]) -> None:
+        """Replaces string node keys with UUID keys. Used for the v2 schema migration."""
+        new_G = nx.MultiDiGraph()
+        for name, uid in name_to_id.items():
+            new_G.add_node(uid, name=name)
+        for source, target, data in self.G.edges(data=True):
+            src_id = name_to_id[str(source)]
+            tgt_id = name_to_id[str(target)]
+            new_G.add_edge(src_id, tgt_id, **data)
+        self.G = new_G
+        self._fact_edge_index = self._build_fact_edge_index()
+        self.write_graph()
+
+    def remove_fact_reference(self, fact_id: str) -> int:
+        """Removes fact_id from every edge that references it.
+
+        Edges whose source_fact_ids list becomes empty are deleted.
+        Nodes that become isolated after edge deletion are removed.
+        Returns the number of edges deleted.
+
+        O(1) in the number of edges, not O(E), courtesy of _fact_edge_index.
+        Legacy edges with no source_fact_ids are left in place and cleaned up
+        by the degree-0 orphan sweep in the consolidation routine.
+        """
+        edge_refs = self._fact_edge_index.pop(fact_id, [])
+        if not edge_refs:
+            return 0
+
+        edges_to_remove: list[tuple[str, str, int]] = []
+        for s, t, k in edge_refs:
+            if not self.G.has_edge(s, t, key=k):
+                continue
+            source_ids: list = self.G[s][t][k].get('source_fact_ids', [])
+            if fact_id in source_ids:
+                source_ids.remove(fact_id)
+            if not source_ids:
+                edges_to_remove.append((s, t, k))
+
+        for s, t, k in edges_to_remove:
+            if self.G.has_edge(s, t, key=k):
+                self.G.remove_edge(s, t, key=k)
+            if self.G.has_node(s) and self.G.degree(s) == 0:
+                self.G.remove_node(s)
+            if self.G.has_node(t) and self.G.degree(t) == 0:
+                self.G.remove_node(t)
+
+        if edges_to_remove:
+            self.write_graph()
+
+        return len(edges_to_remove)
+
+    def remove_relationship(self, subject_id: str, object_id: str):
+        """Removes all edges between subject_id and object_id and cleans up orphaned nodes."""
+        if not self.G.has_edge(subject_id, object_id):
+            return
+
+        for k, data in dict(self.G[subject_id][object_id]).items():
+            for fid in data.get('source_fact_ids', []):
+                if fid in self._fact_edge_index:
+                    self._fact_edge_index[fid] = [
+                        (s, t, ki) for s, t, ki in self._fact_edge_index[fid]
+                        if not (s == subject_id and t == object_id and ki == k)
+                    ]
+            if self.G.has_edge(subject_id, object_id, key=k):
+                self.G.remove_edge(subject_id, object_id, key=k)
+
+        if self.G.has_node(subject_id) and self.G.degree(subject_id) == 0:
+            self.G.remove_node(subject_id)
+        if self.G.has_node(object_id) and self.G.degree(object_id) == 0:
+            self.G.remove_node(object_id)
+        self.write_graph()
+
+    def clear(self):
+        """Wipes all nodes, edges, and the fact index, then persists the empty graph."""
+        self.G.clear()
+        self._fact_edge_index = {}
+        self.write_graph()
+
+    def write_graph(self):
+        with open(self.filepath, 'w') as outfile:
+            data = json_graph.node_link_data(self.G)
+            json.dump(data, outfile, indent=4)

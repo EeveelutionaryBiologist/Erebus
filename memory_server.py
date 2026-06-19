@@ -358,8 +358,7 @@ def clear_all_memories():
     collection = chroma_client.create_collection("nyxx_memory")
     
     # 3. Clear Graph
-    knowledge_graph.G.clear()
-    knowledge_graph.write_graph()
+    knowledge_graph.clear()
     
     return {"status": "success", "message": "All databases and graphs wiped clean."}
 
