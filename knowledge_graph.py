@@ -184,6 +184,8 @@ class KnowledgeRelationshipGraph:
                         (s, t, ki) for s, t, ki in self._fact_edge_index[fid]
                         if not (s == subject_id and t == object_id and ki == k)
                     ]
+                    if not self._fact_edge_index[fid]:
+                        del self._fact_edge_index[fid]
             if self.G.has_edge(subject_id, object_id, key=k):
                 self.G.remove_edge(subject_id, object_id, key=k)
 

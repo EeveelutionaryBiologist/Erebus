@@ -1,12 +1,19 @@
 import json
 from pathlib import Path
 from llama_cpp import Llama
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from pydantic import BaseModel, Field
+
+# TODO: Move this to a config file
+MUCH_RAM = True
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "Embedding"
-LIBRARIAN_MODEL_PATH = MODEL_DIR / "qwen2.5-3b-instruct-q4_k_m.gguf"
+
+if MUCH_RAM:
+    LIBRARIAN_MODEL_PATH = MODEL_DIR / "qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf"
+else:
+    LIBRARIAN_MODEL_PATH = MODEL_DIR / "qwen2.5-3b-instruct-q4_k_m.gguf"
 
 
 # Global variable for the model
@@ -51,11 +58,18 @@ def load_librarian_model():
     if not LIBRARIAN_MODEL_PATH.exists():
         print("[SYSTEM] Downloading librarian background model...")
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        hf_hub_download(
-            repo_id="Qwen/Qwen2.5-3B-Instruct-GGUF",
-            filename="qwen2.5-3b-instruct-q4_k_m.gguf",
-            local_dir=MODEL_DIR,
-        )
+        if MUCH_RAM:
+            snapshot_download(
+                repo_id="Qwen/Qwen2.5-7B-Instruct-GGUF",
+                local_dir=MODEL_DIR,
+                allow_patterns=["qwen2.5-7b-instruct-q4_k_m*"]
+            )
+        else:
+            hf_hub_download(
+                repo_id="Qwen/Qwen2.5-3B-Instruct-GGUF",
+                filename="qwen2.5-3b-instruct-q4_k_m.gguf",
+                local_dir=MODEL_DIR,
+            )
     print("[SYSTEM] Initializing Llama.cpp Librarian Model in RAM...")
     librarian_llm = Llama(
         model_path=str(LIBRARIAN_MODEL_PATH), 

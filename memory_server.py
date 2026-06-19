@@ -31,11 +31,13 @@ CONSOLIDATION_PASSES = 2
 app = FastAPI(title="Erebus Memory Microservice")
 
 BASE_DIR = Path(__file__).resolve().parent
+
 MEMORY_DIR = BASE_DIR / "DB"
 GRAPH_DIR = BASE_DIR / "KnowledgeGraph"
 CHROMA_PATH = MEMORY_DIR / "chromadb"
 SQLITE_PATH = MEMORY_DIR / "metadata.db"
 EMBEDDING_DIR = BASE_DIR / "Embedding"
+
 GGUF_MODEL_PATH = EMBEDDING_DIR / "bge-base-en-v1.5-f16.gguf"
 
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
