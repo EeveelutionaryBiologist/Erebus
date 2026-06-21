@@ -174,6 +174,41 @@ class TestGetAllMemories:
         assert resp.status_code == 200
         assert resp.json()["results"] == []
 
+    def _seed(self, app_client, monkeypatch):
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["A fact."],
+                triples=[KnowledgeTriple(subject="X", predicate="IS", object="Y")],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "some text"})
+
+    def test_all_type_raw_returns_only_raw(self, app_client, monkeypatch):
+        self._seed(app_client, monkeypatch)
+        resp = app_client.get("/memory/all?type=raw")
+        assert resp.status_code == 200
+        types = {r["record_type"] for r in resp.json()["results"]}
+        assert types == {"raw"}
+
+    def test_all_type_fact_returns_only_facts(self, app_client, monkeypatch):
+        self._seed(app_client, monkeypatch)
+        resp = app_client.get("/memory/all?type=fact")
+        assert resp.status_code == 200
+        types = {r["record_type"] for r in resp.json()["results"]}
+        assert types == {"fact"}
+
+    def test_all_type_entity_returns_only_entities(self, app_client, monkeypatch):
+        self._seed(app_client, monkeypatch)
+        resp = app_client.get("/memory/all?type=entity")
+        assert resp.status_code == 200
+        types = {r["record_type"] for r in resp.json()["results"]}
+        assert types == {"entity"}
+
+    def test_all_invalid_type_returns_422(self, app_client):
+        resp = app_client.get("/memory/all?type=garbage")
+        assert resp.status_code == 422
+
 
 # ---------------------------------------------------------------------------
 # DELETE /memory/clear

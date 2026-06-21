@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
+from typing import Literal
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import chromadb
@@ -425,19 +427,25 @@ def context_memory(search: SearchQuery):
     }
 
 @app.get("/memory/all")
-def get_all_memories():
-    """Retrieves all records from all three tables in a unified flat list."""
+def get_all_memories(type: Literal["raw", "fact", "entity"] | None = None):
+    """Retrieves records from SQLite. Optionally filtered by ?type=raw|fact|entity.
+
+    Omitting ?type returns all three record types in a flat list (original behaviour).
+    """
     cursor = sqlite_conn.cursor()
     results = []
 
-    cursor.execute("SELECT id, content, 0, created_at FROM raw_chunks ORDER BY created_at DESC")
-    results += [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": "raw"} for r in cursor.fetchall()]
+    if type is None or type == "raw":
+        cursor.execute("SELECT id, content, 0, created_at FROM raw_chunks ORDER BY created_at DESC")
+        results += [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": "raw"} for r in cursor.fetchall()]
 
-    cursor.execute("SELECT id, content, hit_count, created_at FROM atomic_facts ORDER BY created_at DESC")
-    results += [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": "fact"} for r in cursor.fetchall()]
+    if type is None or type == "fact":
+        cursor.execute("SELECT id, content, hit_count, created_at FROM atomic_facts ORDER BY created_at DESC")
+        results += [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": "fact"} for r in cursor.fetchall()]
 
-    cursor.execute("SELECT id, canonical_name, hit_count, created_at FROM entities ORDER BY created_at DESC")
-    results += [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": "entity"} for r in cursor.fetchall()]
+    if type is None or type == "entity":
+        cursor.execute("SELECT id, canonical_name, hit_count, created_at FROM entities ORDER BY created_at DESC")
+        results += [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": "entity"} for r in cursor.fetchall()]
 
     return {"results": results}
 
