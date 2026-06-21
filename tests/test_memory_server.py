@@ -241,3 +241,215 @@ class TestConsolidateMemories:
         facts = [r for r in resp.json()["results"] if r["record_type"] == "fact"]
         duplicate_facts = [f for f in facts if f["text"] == "Duplicate fact."]
         assert len(duplicate_facts) == 1
+
+
+# ---------------------------------------------------------------------------
+# Entity / predicate normalization
+# ---------------------------------------------------------------------------
+
+class TestNormalization:
+    # -- Pure unit tests (no server, no fixtures needed) --------------------
+
+    def test_entity_name_lowercased_input(self):
+        from memory_server import normalize_entity_name
+        assert normalize_entity_name("hailey") == "Hailey"
+
+    def test_entity_name_allcaps_input(self):
+        from memory_server import normalize_entity_name
+        assert normalize_entity_name("ALICE SMITH") == "Alice Smith"
+
+    def test_entity_name_already_canonical(self):
+        from memory_server import normalize_entity_name
+        assert normalize_entity_name("Alice") == "Alice"
+
+    def test_entity_name_strips_whitespace(self):
+        from memory_server import normalize_entity_name
+        assert normalize_entity_name("  Bob  ") == "Bob"
+
+    def test_predicate_uppercased(self):
+        from memory_server import normalize_predicate
+        assert normalize_predicate("has") == "HAS"
+
+    def test_predicate_spaces_become_underscores(self):
+        from memory_server import normalize_predicate
+        assert normalize_predicate("works at") == "WORKS_AT"
+
+    def test_predicate_synonym_has_a(self):
+        from memory_server import normalize_predicate
+        assert normalize_predicate("has a") == "HAS"
+
+    def test_predicate_synonym_is_a(self):
+        from memory_server import normalize_predicate
+        assert normalize_predicate("is a") == "IS"
+
+    def test_predicate_synonym_works_for(self):
+        from memory_server import normalize_predicate
+        assert normalize_predicate("works for") == "WORKS_AT"
+
+    def test_predicate_already_canonical(self):
+        from memory_server import normalize_predicate
+        assert normalize_predicate("OWNS") == "OWNS"
+
+    def test_predicate_idempotent(self):
+        from memory_server import normalize_predicate
+        assert normalize_predicate("WORKS_AT") == "WORKS_AT"
+
+    # -- Integration tests (require app_client) -----------------------------
+
+    def test_case_variant_entities_collapse_to_one_row(self, app_client, monkeypatch):
+        """'hailey' and 'HAILEY' from the LLM should land in a single entity row."""
+        call_count = [0]
+        def variant_chunk(text):
+            call_count[0] += 1
+            name = "hailey" if call_count[0] == 1 else "HAILEY"
+            return MemoryProcessing(
+                atomic_facts=[f"{name} has a cat."],
+                triples=[KnowledgeTriple(subject=name, predicate="HAS", object="Cat")],
+            )
+        monkeypatch.setattr("memory_server.process_memory_chunk", variant_chunk)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        resp = app_client.get("/memory/all")
+        entities = [r for r in resp.json()["results"] if r["record_type"] == "entity"]
+        hailey_rows = [e for e in entities if e["text"].lower() == "hailey"]
+        assert len(hailey_rows) == 1
+
+    def test_synonym_predicates_collapse_to_one_edge(self, app_client, monkeypatch):
+        """'has a' and 'has' must map to one 'HAS' edge, not two separate edges."""
+        import memory_server
+        call_count = [0]
+        def variant_chunk(text):
+            call_count[0] += 1
+            pred = "has a" if call_count[0] == 1 else "has"
+            return MemoryProcessing(
+                atomic_facts=["Alice has a cat."],
+                triples=[KnowledgeTriple(subject="Alice", predicate=pred, object="Cat")],
+            )
+        monkeypatch.setattr("memory_server.process_memory_chunk", variant_chunk)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        kg = memory_server.knowledge_graph
+        all_edges = list(kg.G.edges(data=True))
+        has_edges = [e for e in all_edges if e[2].get("relation") == "HAS"]
+        assert len(has_edges) == 1
+
+    def test_normalized_entity_name_stored_in_sqlite(self, app_client, monkeypatch):
+        """Canonical name stored in SQLite must be title-cased regardless of LLM output."""
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["mochi is a cat."],
+                triples=[KnowledgeTriple(subject="mochi", predicate="IS", object="cat")],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "mochi is a cat."})
+
+        resp = app_client.get("/memory/all")
+        entities = [r for r in resp.json()["results"] if r["record_type"] == "entity"]
+        names = {e["text"] for e in entities}
+        assert "Mochi" in names
+        assert "Cat" in names
+
+
+# ---------------------------------------------------------------------------
+# POST /memory/context
+# ---------------------------------------------------------------------------
+
+class TestContextMemory:
+    # -- Unit tests for the regex tokenizer (no server needed) --------------
+
+    def test_extract_candidates_single_words(self):
+        from memory_server import _extract_entity_candidates
+        result = _extract_entity_candidates("Alice owns a bakery")
+        assert "Alice" in result
+        assert "bakery" in result
+
+    def test_extract_candidates_bigrams(self):
+        from memory_server import _extract_entity_candidates
+        result = _extract_entity_candidates("Alice Smith owns a bakery")
+        assert "Alice Smith" in result
+
+    def test_extract_candidates_deduplicates(self):
+        from memory_server import _extract_entity_candidates
+        result = _extract_entity_candidates("alice alice")
+        assert result.count("alice") == 1
+
+    def test_extract_candidates_empty_string(self):
+        from memory_server import _extract_entity_candidates
+        assert _extract_entity_candidates("") == []
+
+    # -- Integration tests --------------------------------------------------
+
+    def _seed(self, app_client, monkeypatch):
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["Alice owns a bakery."],
+                triples=[KnowledgeTriple(subject="Alice", predicate="OWNS", object="Bakery")],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "Alice owns a bakery."})
+
+    def test_context_returns_expected_keys(self, app_client, monkeypatch):
+        self._seed(app_client, monkeypatch)
+        resp = app_client.post("/memory/context", json={"query": "Alice"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "results" in body
+        assert "relational_context" in body
+
+    def test_context_no_librarian_called(self, app_client, monkeypatch):
+        """The /context endpoint must never touch the Librarian."""
+        def should_not_be_called(*args, **kwargs):
+            raise AssertionError("Librarian must not be called from /memory/context")
+
+        for fn in ["process_memory_chunk", "extract_entities_from_text",
+                   "librarian_should_merge", "librarian_split_compound"]:
+            monkeypatch.setattr(f"memory_server.{fn}", should_not_be_called)
+
+        resp = app_client.post("/memory/context", json={"query": "anything"})
+        assert resp.status_code == 200
+
+    def test_context_returns_vector_results(self, app_client, monkeypatch):
+        self._seed(app_client, monkeypatch)
+        resp = app_client.post("/memory/context", json={"query": "bakery ownership"})
+        assert resp.status_code == 200
+        # Stub embeddings are all [0.1]*768 so cosine similarity is 1.0 for every pair;
+        # the seeded fact must appear in the results.
+        assert len(resp.json()["results"]) >= 1
+
+    def test_context_graph_lookup_finds_known_entity(self, app_client, monkeypatch):
+        self._seed(app_client, monkeypatch)
+        resp = app_client.post("/memory/context", json={"query": "What does Alice own?"})
+        assert "Alice" in resp.json()["relational_context"]
+
+    def test_context_graph_lookup_case_insensitive(self, app_client, monkeypatch):
+        self._seed(app_client, monkeypatch)
+        resp = app_client.post("/memory/context", json={"query": "what does alice own?"})
+        assert "Alice" in resp.json()["relational_context"]
+
+    def test_context_increments_fact_hit_count(self, app_client, monkeypatch):
+        self._seed(app_client, monkeypatch)
+        app_client.post("/memory/context", json={"query": "bakery"})
+
+        resp = app_client.get("/memory/all")
+        facts = [r for r in resp.json()["results"] if r["record_type"] == "fact"]
+        assert any(r["hit_count"] >= 1 for r in facts)
+
+    def test_context_increments_entity_hit_count(self, app_client, monkeypatch):
+        self._seed(app_client, monkeypatch)
+        app_client.post("/memory/context", json={"query": "Alice"})
+
+        resp = app_client.get("/memory/all")
+        entities = [r for r in resp.json()["results"] if r["record_type"] == "entity"]
+        alice = next((e for e in entities if e["text"] == "Alice"), None)
+        assert alice is not None and alice["hit_count"] >= 1
+
+    def test_context_empty_db_returns_empty(self, app_client):
+        resp = app_client.post("/memory/context", json={"query": "anything"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["results"] == []
+        assert body["relational_context"] == ""

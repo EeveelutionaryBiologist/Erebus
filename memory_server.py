@@ -171,6 +171,31 @@ def _migrate_to_v2():
         _migrate_kg_nodes(cursor)
         sqlite_conn.commit()
 
+# ---------------------------------------------------------------------------
+# Write-time normalization
+# ---------------------------------------------------------------------------
+
+# Syntactic-variant collapse only — same-direction, no semantic rewrites.
+_PREDICATE_SYNONYMS: dict[str, str] = {
+    "HAVE":      "HAS",
+    "HAVE_A":    "HAS",
+    "HAS_A":     "HAS",
+    "IS_A":      "IS",
+    "IS_AN":     "IS",
+    "WORKS_FOR": "WORKS_AT",
+}
+
+def normalize_entity_name(name: str) -> str:
+    """Title-cases an entity name so 'hailey' and 'HAILEY' both become 'Hailey'."""
+    return name.strip().title()
+
+def normalize_predicate(pred: str) -> str:
+    """Uppercases a predicate and collapses known syntactic variants to a canonical form."""
+    normalized = re.sub(r"\s+", "_", pred.strip().upper())
+    return _PREDICATE_SYNONYMS.get(normalized, normalized)
+
+# ---------------------------------------------------------------------------
+
 def get_or_create_entity(name: str) -> str:
     """Returns the entity UUID for `name`, inserting a new row if it doesn't exist."""
     cursor = sqlite_conn.cursor()
@@ -258,14 +283,17 @@ def add_memory(memory: MemoryInput):
 
     # 4. Save Triples to Knowledge Graph, linked to this batch's fact IDs
     for triple in processed_data.triples:
-        subject_id = get_or_create_entity(triple.subject)
-        object_id  = get_or_create_entity(triple.object)
+        subj = normalize_entity_name(triple.subject)
+        obj  = normalize_entity_name(triple.object)
+        pred = normalize_predicate(triple.predicate)
+        subject_id = get_or_create_entity(subj)
+        object_id  = get_or_create_entity(obj)
         knowledge_graph.add_relationship(
-            subject_id, triple.predicate, object_id,
-            subject_name=triple.subject, object_name=triple.object,
+            subject_id, pred, object_id,
+            subject_name=subj, object_name=obj,
             fact_ids=fact_ids_batch
         )
-        print(f"  -> Graph Mapped: {triple.subject} [{triple.predicate}] {triple.object}")
+        print(f"  -> Graph Mapped: {subj} [{pred}] {obj}")
     
     return {
         "status": "success", 
@@ -325,6 +353,75 @@ def search_memory(search: SearchQuery):
     return {
         "results": final_results,
         "relational_context": summarized_context
+    }
+
+def _extract_entity_candidates(query: str) -> list[str]:
+    """Tokenizes a query into words and bigrams for entity lookup without the Librarian."""
+    words = re.findall(r"[a-zA-Z']+", query)
+    candidates = list(words)
+    for i in range(len(words) - 1):
+        candidates.append(f"{words[i]} {words[i + 1]}")
+    # Deduplicate case-insensitively while preserving first-occurrence order.
+    seen: set[str] = set()
+    result: list[str] = []
+    for c in candidates:
+        key = c.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(c)
+    return result
+
+@app.post("/memory/context")
+def context_memory(search: SearchQuery):
+    """Fast-path retrieval for Nyxx: vector search + regex-driven depth-1 graph lookup.
+
+    No Librarian calls. Designed to stay well under 100ms on cached embeddings.
+    Hit counts are updated so pruning reflects actual usage across both retrieval paths.
+    """
+    now = datetime.now().isoformat()
+    cursor = sqlite_conn.cursor()
+
+    # --- 1. VECTOR SEARCH ---
+    query_vector = get_embedding(search.query)
+    results = collection.query(
+        query_embeddings=[query_vector],
+        n_results=search.top_k
+    )
+
+    final_results = []
+    if results["ids"] and results["ids"][0]:
+        for mem_id in results["ids"][0]:
+            cursor.execute(
+                "UPDATE atomic_facts SET hit_count = hit_count + 1, last_accessed = ? WHERE id = ?",
+                (now, mem_id),
+            )
+            cursor.execute("SELECT content, hit_count FROM atomic_facts WHERE id = ?", (mem_id,))
+            row = cursor.fetchone()
+            if row:
+                final_results.append({"text": row[0], "hit_count": row[1]})
+
+    # --- 2. GRAPH RETRIEVAL (no Librarian — regex candidates only) ---
+    relation_facts: list[str] = []
+    for candidate in _extract_entity_candidates(search.query):
+        entity_id = lookup_entity(candidate)
+        if not entity_id:
+            continue
+        facts = knowledge_graph.retrieve_relationships(entity_id, depth=1)
+        if facts:
+            relation_facts.extend(facts)
+            cursor.execute(
+                "UPDATE entities SET hit_count = hit_count + 1, last_accessed = ? WHERE id = ?",
+                (now, entity_id),
+            )
+
+    sqlite_conn.commit()
+
+    # Deduplicate while preserving encounter order.
+    relational_context = "\n".join(dict.fromkeys(relation_facts))
+
+    return {
+        "results": final_results,
+        "relational_context": relational_context,
     }
 
 @app.get("/memory/all")
