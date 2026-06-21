@@ -19,10 +19,12 @@ from librarian import (
     load_librarian_model,
     process_memory_chunk,
     extract_entities_from_text,
+    extract_context_hint,
     librarian_summarize,
     librarian_should_merge,
     librarian_split_compound,
     librarian_check_supersession,
+    ContextHint,
 )
 from knowledge_graph import KnowledgeRelationshipGraph
 
@@ -252,6 +254,9 @@ HIGH_SIM_DEDUP_THRESHOLD = 0.99
 # almost always already atomic, so skip the Librarian call to save CPU).
 COMPOUND_CHECK_MIN_CHARS = 120
 
+# /memory/learn chunking
+LEARN_CHUNK_SIZE = 5  # target sentences per chunk (no overlap to avoid duplicate ingestion)
+
 # Phase 4 (Supersession / Contradiction)
 # Maps a past-tense predicate to its present-tense counterpart. When both exist for the
 # same (subject, object) entity pair, the past-tense edge's source facts are marked historical.
@@ -270,6 +275,18 @@ CONTRADICTION_PREDICATE_PAIRS: list[tuple[str, str]] = [
 # ==========================================
 # 5. API ENDPOINTS
 # ==========================================
+_SENTENCE_BOUNDARY = re.compile(r'(?<=[.!?])\s+')
+
+def _split_into_chunks(text: str, chunk_size: int) -> list[str]:
+    """Splits text on sentence boundaries into chunks of up to chunk_size sentences."""
+    sentences = [s for s in _SENTENCE_BOUNDARY.split(text.strip()) if s.strip()]
+    return [" ".join(sentences[i:i + chunk_size]) for i in range(0, len(sentences), chunk_size)]
+
+def _format_context_hint(hint: ContextHint) -> str | None:
+    """Formats a ContextHint as a '[CONTEXT: ...]' prefix, or None if both fields are empty."""
+    parts = [p for p in (hint.subject, hint.time_period) if p]
+    return f"[CONTEXT: {', '.join(parts)}] " if parts else None
+
 class MemoryInput(BaseModel):
     text: str
 
@@ -331,8 +348,53 @@ def add_memory(memory: MemoryInput):
         knowledge_graph.write_graph()
     
     return {
-        "status": "success", 
-        "message": f"Added {len(processed_data.atomic_facts)} standalone facts and {len(processed_data.triples)} graph relations."
+        "status": "success",
+        "message": f"Added {len(processed_data.atomic_facts)} standalone facts and {len(processed_data.triples)} graph relations.",
+        "facts_added": len(processed_data.atomic_facts),
+        "triples_added": len(processed_data.triples),
+    }
+
+
+@app.post("/memory/learn")
+def learn_from_source(memory: MemoryInput):
+    """Splits large text into sentence-boundary chunks and feeds each through /memory/add.
+
+    For multi-chunk inputs, the first chunk is passed to extract_context_hint() to produce a
+    short [CONTEXT: subject, time_period] prefix. This prefix is prepended to all subsequent
+    chunks before Librarian processing, grounding pronoun resolution and temporal tagging
+    across chunk boundaries. Works best for single-subject texts (biographies, diaries).
+    """
+    chunks = _split_into_chunks(memory.text, LEARN_CHUNK_SIZE)
+    if not chunks:
+        return {"status": "success", "chunks_total": 0, "chunks_succeeded": 0,
+                "facts_added": 0, "triples_added": 0, "errors": []}
+
+    context_prefix: str | None = None
+    if len(chunks) > 1:
+        hint = extract_context_hint(chunks[0])
+        if hint:
+            context_prefix = _format_context_hint(hint)
+
+    facts_added = 0
+    triples_added = 0
+    errors: list[dict] = []
+
+    for i, chunk in enumerate(chunks):
+        chunk_text = (context_prefix + chunk) if (context_prefix and i > 0) else chunk
+        try:
+            result = add_memory(MemoryInput(text=chunk_text))
+            facts_added += result["facts_added"]
+            triples_added += result["triples_added"]
+        except HTTPException as e:
+            errors.append({"chunk_index": i, "text": chunk[:80], "error": e.detail})
+
+    return {
+        "status": "success" if not errors else "partial",
+        "chunks_total": len(chunks),
+        "chunks_succeeded": len(chunks) - len(errors),
+        "facts_added": facts_added,
+        "triples_added": triples_added,
+        "errors": errors,
     }
 
 @app.post("/memory/search")
@@ -512,7 +574,7 @@ def clear_all_memories():
 @app.post("/memory/consolidate")
 def consolidate_memories():
     """
-    Four-phase memory hygiene pass:
+    Five-phase memory hygiene pass:
       Phase 0 – Exact dedup: collapse identical fact text to a single row.
       Phase 1 – Prune: delete stale, never-retrieved atomic facts from ChromaDB + SQLite.
       Phase 2 – Merge: detect near-duplicate fact pairs via cosine similarity; ask the

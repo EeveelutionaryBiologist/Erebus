@@ -99,5 +99,8 @@ def app_client(tmp_path, monkeypatch):
     monkeypatch.setattr(memory_server, "hf_hub_download", MagicMock())
     monkeypatch.setattr(memory_server, "load_librarian_model", MagicMock())
 
+    # Default: no context hint (tests that need hint behaviour override this)
+    monkeypatch.setattr(memory_server, "extract_context_hint", lambda text: None)
+
     with TestClient(memory_server.app) as client:
         yield client

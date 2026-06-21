@@ -79,6 +79,16 @@ class SupersessionDecision(BaseModel):
         description="Brief explanation of the relationship between the two facts."
     )
 
+class ContextHint(BaseModel):
+    subject: str | None = Field(
+        default=None,
+        description="The primary person or entity this text is mainly about, or null if unclear."
+    )
+    time_period: str | None = Field(
+        default=None,
+        description="The temporal setting (e.g., 'college years', '2010-2015'), or null if unknown or present-day."
+    )
+
 # --- FUNCTIONS ---
 def load_librarian_model():
     """Downloads and loads the local Librarian model permanently into RAM."""
@@ -126,7 +136,9 @@ def process_memory_chunk(text: str) -> MemoryProcessing:
         "Set temporal_status to 'current' for present-tense or timeless facts. "
         "Set temporal_status to 'uncertain' only when the temporal state is genuinely ambiguous. "
         "Set valid_period to a short phrase when a time window is mentioned (e.g., 'during college', '2010–2015'); "
-        "otherwise leave it null.\n"
+        "otherwise leave it null. "
+        "IMPORTANT: If the text begins with a '[CONTEXT: ...]' line, use it only to resolve pronouns and infer "
+        "temporal context — never emit it as a fact itself.\n"
         "2. Extract 'triples': Subject-predicate-object relationships from the text. "
         "Use past-tense predicates (WAS, HAD) for historical facts and present-tense (IS, HAS) for current ones."
     )
@@ -288,6 +300,39 @@ def librarian_summarize(facts: list[str]) -> str:
     )
     
     return response['choices'][0]['message']['content']
+
+def extract_context_hint(text: str) -> ContextHint | None:
+    """Extracts subject and temporal setting from the first chunk of a /learn input.
+
+    The result is formatted as a [CONTEXT: ...] prefix and prepended to subsequent chunks
+    so the Librarian can resolve pronouns and assign valid_period consistently across
+    chunk boundaries. Works best for single-subject texts (biographies, diaries).
+    """
+    if librarian_llm is None:
+        raise ValueError("Librarian model not loaded.")
+
+    system_prompt = (
+        "Extract a brief context summary from this text passage. "
+        "Identify: (1) the primary subject — the person or entity the text is mainly about; "
+        "(2) the temporal setting — a year range or life phase ('during college', '2010-2015') "
+        "if one is clearly implied. Set both to null if genuinely unknown."
+    )
+
+    response = librarian_llm.create_chat_completion(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Extract context from: '{text}'"},
+        ],
+        response_format={"type": "json_object", "schema": ContextHint.model_json_schema()},
+        temperature=0.1,
+    )
+
+    try:
+        return ContextHint(**json.loads(response["choices"][0]["message"]["content"]))
+    except Exception as e:
+        print(f"[LIBRARIAN ERROR] Context hint extraction failed: {e}")
+        return None
+
 
 def memory_consolidation_routine():
     """

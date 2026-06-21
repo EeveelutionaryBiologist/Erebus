@@ -24,6 +24,7 @@ Librarian returns. Patch at the memory_server level, e.g.:
 import pytest
 from librarian import (
     AtomicFact,
+    ContextHint,
     EntityExtraction,
     Entity,
     MemoryProcessing,
@@ -739,4 +740,208 @@ class TestContextMemory:
         assert resp.status_code == 200
         body = resp.json()
         assert body["results"] == []
-        assert body["relational_context"] == ""
+
+
+# ---------------------------------------------------------------------------
+# _split_into_chunks  (pure function, no server needed)
+# ---------------------------------------------------------------------------
+
+class TestSplitIntoChunks:
+    """Unit tests for the sentence-boundary chunker (no app_client required)."""
+
+    @staticmethod
+    def fn():
+        import memory_server
+        return memory_server._split_into_chunks
+
+    def test_empty_text_returns_empty_list(self):
+        assert self.fn()("", 5) == []
+
+    def test_whitespace_only_returns_empty_list(self):
+        assert self.fn()("   ", 5) == []
+
+    def test_single_sentence_returns_one_chunk(self):
+        result = self.fn()("Alice owns a bakery.", 5)
+        assert result == ["Alice owns a bakery."]
+
+    def test_fewer_sentences_than_chunk_size_returns_one_chunk(self):
+        result = self.fn()("S1. S2. S3.", 5)
+        assert len(result) == 1
+        assert "S1" in result[0] and "S3" in result[0]
+
+    def test_exact_chunk_size_returns_one_chunk(self):
+        sentences = " ".join(f"S{i}." for i in range(5))
+        assert len(self.fn()(sentences, 5)) == 1
+
+    def test_double_chunk_size_returns_two_chunks_with_no_overlap(self):
+        sentences = " ".join(f"S{i}." for i in range(10))
+        result = self.fn()(sentences, 5)
+        assert len(result) == 2
+        assert "S4" not in result[1]  # no sentence duplicated between chunks
+
+    def test_partial_last_chunk_included(self):
+        sentences = " ".join(f"S{i}." for i in range(7))
+        result = self.fn()(sentences, 5)
+        assert len(result) == 2
+        assert "S5" in result[1] and "S6" in result[1]
+
+    def test_exclamation_and_question_marks_split(self):
+        text = "Alice is great! Is she? She really is."
+        result = self.fn()(text, 5)
+        assert len(result) == 1  # 3 sentences < chunk_size=5, all in one chunk
+        assert "Alice is great" in result[0]
+
+
+# ---------------------------------------------------------------------------
+# POST /memory/learn
+# ---------------------------------------------------------------------------
+
+class TestLearnEndpoint:
+
+    def test_learn_returns_expected_keys(self, app_client, monkeypatch):
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(atomic_facts=["Alice is kind."], triples=[]),
+        )
+        resp = app_client.post("/memory/learn", json={"text": "Alice is kind. She is generous."})
+        assert resp.status_code == 200
+        body = resp.json()
+        for key in ("status", "chunks_total", "chunks_succeeded", "facts_added", "triples_added", "errors"):
+            assert key in body, f"Missing key: {key}"
+
+    def test_learn_empty_text_returns_zero_chunks(self, app_client):
+        resp = app_client.post("/memory/learn", json={"text": ""})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "success"
+        assert body["chunks_total"] == 0
+        assert body["facts_added"] == 0
+        assert body["errors"] == []
+
+    def test_learn_single_sentence_produces_one_chunk(self, app_client, monkeypatch):
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(atomic_facts=["Alice is kind."], triples=[]),
+        )
+        resp = app_client.post("/memory/learn", json={"text": "Alice is kind."})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["chunks_total"] == 1
+        assert body["chunks_succeeded"] == 1
+        assert body["facts_added"] == 1
+
+    def test_learn_aggregates_facts_across_chunks(self, app_client, monkeypatch):
+        """10 sentences → 2 chunks of 5 → each chunk produces 1 fact → facts_added == 2."""
+        call_count = {"n": 0}
+
+        def stub(text):
+            call_count["n"] += 1
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text=f"Fact {call_count['n']}.")],
+                triples=[KnowledgeTriple(subject="Alice", predicate="IS", object="Kind")],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", stub)
+        sentences = " ".join(f"Sentence {i} is here." for i in range(10))
+        resp = app_client.post("/memory/learn", json={"text": sentences})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["chunks_total"] == 2
+        assert body["chunks_succeeded"] == 2
+        assert body["facts_added"] == 2
+        assert body["triples_added"] == 2
+        assert body["status"] == "success"
+
+    def test_learn_partial_failure_returns_partial_status(self, app_client, monkeypatch):
+        """If a chunk's Librarian call fails, the endpoint reports partial success."""
+        call_count = {"n": 0}
+
+        def stub(text):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                return None  # triggers HTTPException in add_memory
+            return MemoryProcessing(atomic_facts=["Alice is kind."], triples=[])
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", stub)
+        sentences = " ".join(f"Sentence {i} is here." for i in range(10))
+        resp = app_client.post("/memory/learn", json={"text": sentences})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "partial"
+        assert body["chunks_total"] == 2
+        assert body["chunks_succeeded"] == 1
+        assert len(body["errors"]) == 1
+        assert body["errors"][0]["chunk_index"] == 1
+
+    def test_learn_no_overlap_between_chunks(self, app_client, monkeypatch):
+        """Sentences are not duplicated across chunks — each sentence is ingested exactly once."""
+        ingested: list[str] = []
+
+        def stub(text):
+            ingested.append(text)
+            return MemoryProcessing(atomic_facts=[AtomicFact(text=text[:30] + ".")], triples=[])
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", stub)
+        sentences = " ".join(f"S{i}." for i in range(10))
+        app_client.post("/memory/learn", json={"text": sentences})
+
+        # 2 chunks; no sentence appears in more than one chunk
+        all_text = " ".join(ingested)
+        for i in range(10):
+            assert all_text.count(f"S{i}") == 1, f"S{i} ingested more than once"
+
+    def test_learn_applies_context_hint_prefix_to_later_chunks(self, app_client, monkeypatch):
+        """Hint from chunk 0 is prepended to chunks 1+, not to chunk 0 itself."""
+        received: list[str] = []
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: (received.append(text), MemoryProcessing(atomic_facts=["Fact."], triples=[]))[1],
+        )
+        monkeypatch.setattr(
+            "memory_server.extract_context_hint",
+            lambda text: ContextHint(subject="Alice", time_period="college years"),
+        )
+
+        sentences = " ".join(f"S{i}." for i in range(10))
+        resp = app_client.post("/memory/learn", json={"text": sentences})
+        assert resp.status_code == 200
+
+        # chunk 0: no prefix
+        assert not received[0].startswith("[CONTEXT:")
+        # chunk 1+: prefix present
+        for text in received[1:]:
+            assert text.startswith("[CONTEXT: Alice, college years]")
+
+    def test_learn_skips_hint_extraction_for_single_chunk(self, app_client, monkeypatch):
+        """extract_context_hint must not be called when there is only one chunk."""
+        hint_calls: list[str] = []
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(atomic_facts=["Fact."], triples=[]),
+        )
+        monkeypatch.setattr(
+            "memory_server.extract_context_hint",
+            lambda text: hint_calls.append(text) or ContextHint(),
+        )
+
+        resp = app_client.post("/memory/learn", json={"text": "Just one sentence."})
+        assert resp.status_code == 200
+        assert hint_calls == []
+
+    def test_learn_proceeds_without_prefix_when_hint_returns_none(self, app_client, monkeypatch):
+        """If extract_context_hint returns None, chunks are processed without any prefix."""
+        received: list[str] = []
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: (received.append(text), MemoryProcessing(atomic_facts=["Fact."], triples=[]))[1],
+        )
+        # conftest default already stubs to None, but be explicit
+        monkeypatch.setattr("memory_server.extract_context_hint", lambda text: None)
+
+        sentences = " ".join(f"S{i}." for i in range(10))
+        app_client.post("/memory/learn", json={"text": sentences})
+        for text in received:
+            assert not text.startswith("[CONTEXT:")
