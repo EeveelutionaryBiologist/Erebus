@@ -23,12 +23,14 @@ Librarian returns. Patch at the memory_server level, e.g.:
 
 import pytest
 from librarian import (
+    AtomicFact,
     EntityExtraction,
     Entity,
     MemoryProcessing,
     KnowledgeTriple,
     MergeDecision,
     SplitDecision,
+    SupersessionDecision,
 )
 
 
@@ -93,6 +95,30 @@ class TestAddMemory:
         monkeypatch.setattr("memory_server.process_memory_chunk", lambda text: None)
         resp = app_client.post("/memory/add", json={"text": "anything"})
         assert resp.status_code == 500
+
+    def test_add_graph_flushed_once_for_multiple_triples(self, app_client, monkeypatch):
+        """write_graph() must be called exactly once per /memory/add, not once per triple."""
+        import memory_server
+        write_calls: list[int] = []
+        real_write = memory_server.knowledge_graph.write_graph
+        monkeypatch.setattr(
+            memory_server.knowledge_graph,
+            "write_graph",
+            lambda: (write_calls.append(1), real_write())[1],
+        )
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["A fact."],
+                triples=[
+                    KnowledgeTriple(subject="Alice", predicate="OWNS", object="Bakery"),
+                    KnowledgeTriple(subject="Alice", predicate="IS", object="Person"),
+                    KnowledgeTriple(subject="Bakery", predicate="IS", object="Business"),
+                ],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "Alice owns a bakery."})
+        assert len(write_calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +282,12 @@ class TestConsolidateMemories:
         resp = app_client.post("/memory/consolidate")
         assert resp.status_code == 200
         report = resp.json()["report"]
-        assert "pruned" in report and "merged" in report and "split" in report
+        assert "pruned" in report
+        assert "merged" in report
+        assert "split" in report
+        assert "superseded" in report
+        assert "flagged" in report
+        assert isinstance(report["flagged"], list)
 
     def test_consolidate_exact_dedup_removes_lower_hit_copy(self, app_client, monkeypatch):
         """Two identical facts added separately must collapse to one after consolidation."""
@@ -276,6 +307,227 @@ class TestConsolidateMemories:
         facts = [r for r in resp.json()["results"] if r["record_type"] == "fact"]
         duplicate_facts = [f for f in facts if f["text"] == "Duplicate fact."]
         assert len(duplicate_facts) == 1
+
+    def test_consolidate_phase4_was_facts_marked_historical(self, app_client, monkeypatch):
+        """When IS and WAS edges exist for the same entity pair, WAS source facts are marked historical."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_triple(_text):
+            call_count[0] += 1
+            pred = "WAS" if call_count[0] == 1 else "IS"
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text=f"Hailey {pred.lower()} a fencer.")],
+                triples=[KnowledgeTriple(subject="Hailey", predicate=pred, object="Fencer")],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_triple)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+
+        resp = app_client.post("/memory/consolidate")
+        assert resp.status_code == 200
+        assert resp.json()["report"]["superseded"] >= 1
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT content, temporal_status FROM atomic_facts")
+        rows = dict(cursor.fetchall())
+        assert rows.get("Hailey was a fencer.") == "historical"
+        assert rows.get("Hailey is a fencer.") == "current"
+
+    def test_consolidate_phase4_contradiction_flagged(self, app_client, monkeypatch):
+        """IS and IS_NOT edges for the same entity pair generate a contradiction flag."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_triple(_text):
+            call_count[0] += 1
+            pred = "IS" if call_count[0] == 1 else "IS_NOT"
+            text = "Alice is a teacher." if pred == "IS" else "Alice is not a teacher."
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text=text)],
+                triples=[KnowledgeTriple(subject="Alice", predicate=pred, object="Teacher")],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_triple)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+
+        resp = app_client.post("/memory/consolidate")
+        assert resp.status_code == 200
+        flagged = resp.json()["report"]["flagged"]
+        assert len(flagged) >= 1
+        entry = flagged[0]
+        assert entry["type"] == "contradiction"
+        assert entry["predicate_a"] == "IS"
+        assert entry["predicate_b"] == "IS_NOT"
+        assert entry["subject"] == "Alice"
+        assert entry["object"] == "Teacher"
+
+    def test_consolidate_phase4_contradiction_not_duplicated_across_passes(self, app_client, monkeypatch):
+        """A contradiction pair is flagged exactly once even when CONSOLIDATION_PASSES > 1."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_triple(_text):
+            call_count[0] += 1
+            pred = "IS" if call_count[0] == 1 else "IS_NOT"
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text=f"Bob {'is' if pred == 'IS' else 'is not'} tall.")],
+                triples=[KnowledgeTriple(subject="Bob", predicate=pred, object="Tall")],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_triple)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+
+        resp = app_client.post("/memory/consolidate")
+        flagged = resp.json()["report"]["flagged"]
+        assert len([f for f in flagged if f["subject"] == "Bob"]) == 1
+
+    def test_consolidate_phase4_supersession_chunk_granularity(self, app_client, monkeypatch):
+        """
+        KNOWN LIMITATION (pinned): supersession marks all facts in a chunk as historical,
+        not just the fact that backs the WAS edge. Fact-to-edge linkage is chunk-level
+        because the Librarian returns atomic_facts and triples as independent lists.
+
+        Here "Hailey owns a dog." incorrectly becomes historical because it shares a
+        batch with the WAS-Fencer edge. Per-triple fact linking would fix this but
+        requires a Librarian schema change.
+        """
+        import memory_server
+
+        call_count = [0]
+
+        def two_fact_chunk(_text):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=[
+                        AtomicFact(text="Hailey was a fencer."),
+                        AtomicFact(text="Hailey owns a dog."),
+                    ],
+                    triples=[
+                        KnowledgeTriple(subject="Hailey", predicate="WAS", object="Fencer"),
+                        KnowledgeTriple(subject="Hailey", predicate="OWNS", object="Dog"),
+                    ],
+                )
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Hailey is a fencer.")],
+                triples=[KnowledgeTriple(subject="Hailey", predicate="IS", object="Fencer")],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", two_fact_chunk)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+
+        app_client.post("/memory/consolidate")
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT content, temporal_status FROM atomic_facts")
+        rows = dict(cursor.fetchall())
+        assert rows.get("Hailey is a fencer.") == "current"
+        # Chunk-granularity limitation: "Hailey owns a dog." shares batch fact_ids
+        # with the WAS-Fencer edge and is incorrectly marked historical.
+        assert rows.get("Hailey owns a dog.") == "historical"
+
+
+# ---------------------------------------------------------------------------
+# Temporal status: parse-time tagging and /context filtering
+# ---------------------------------------------------------------------------
+
+class TestTemporalStatus:
+    def test_add_writes_temporal_status(self, app_client, monkeypatch):
+        """temporal_status from AtomicFact is persisted to the atomic_facts table."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=[
+                    AtomicFact(text="Alice owns a bakery.", temporal_status="current"),
+                    AtomicFact(text="Alice used to live in Paris.", temporal_status="historical",
+                               valid_period="college"),
+                ],
+                triples=[],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "some text"})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT content, temporal_status, valid_period FROM atomic_facts ORDER BY created_at")
+        rows = {r[0]: (r[1], r[2]) for r in cursor.fetchall()}
+        assert rows["Alice owns a bakery."] == ("current", None)
+        assert rows["Alice used to live in Paris."] == ("historical", "college")
+
+    def test_add_string_facts_default_to_current(self, app_client, monkeypatch):
+        """Plain string atomic_facts (backward-compat) are stored with temporal_status='current'."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(atomic_facts=["A timeless fact."], triples=[]),
+        )
+        app_client.post("/memory/add", json={"text": "some text"})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT temporal_status FROM atomic_facts WHERE content = 'A timeless fact.'")
+        row = cursor.fetchone()
+        assert row is not None and row[0] == "current"
+
+    def test_context_excludes_historical_facts(self, app_client, monkeypatch):
+        """Historical facts are excluded from /memory/context results."""
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=[
+                    AtomicFact(text="Alice owns a bakery.", temporal_status="current"),
+                    AtomicFact(text="Alice used to live in Paris.", temporal_status="historical"),
+                ],
+                triples=[],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "some text"})
+
+        resp = app_client.post("/memory/context", json={"query": "Alice"})
+        assert resp.status_code == 200
+        result_texts = [r["text"] for r in resp.json()["results"]]
+        assert "Alice owns a bakery." in result_texts
+        assert "Alice used to live in Paris." not in result_texts
+
+    def test_context_does_not_bump_hit_count_for_historical(self, app_client, monkeypatch):
+        """hit_count must not be incremented for historical facts surfaced by vector search."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Old news.", temporal_status="historical")],
+                triples=[],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "some text"})
+        app_client.post("/memory/context", json={"query": "Old news"})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT hit_count FROM atomic_facts WHERE content = 'Old news.'")
+        row = cursor.fetchone()
+        assert row is not None and row[0] == 0
 
 
 # ---------------------------------------------------------------------------

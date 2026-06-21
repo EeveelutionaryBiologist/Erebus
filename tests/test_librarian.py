@@ -36,7 +36,7 @@ class TestProcessMemoryChunk:
     def test_atomic_facts_are_non_empty_strings(self, librarian):
         result = librarian.process_memory_chunk("Bob likes pizza and hates broccoli.")
         assert result is not None
-        assert all(isinstance(f, str) and f for f in result.atomic_facts)
+        assert all(isinstance(f, str) and f for f in [fact.text for fact in result.atomic_facts])
 
     def test_triples_have_subject_predicate_object(self, librarian):
         result = librarian.process_memory_chunk("Carol works at Acme Corp.")
@@ -48,7 +48,7 @@ class TestProcessMemoryChunk:
         """Atomic facts must not contain bare pronouns like 'she' or 'he'."""
         result = librarian.process_memory_chunk("Hailey has a cat. She loves it.")
         assert result is not None
-        combined = " ".join(result.atomic_facts).lower()
+        combined = " ".join([fact.text for fact in result.atomic_facts]).lower()
 
         assert "she " not in combined and " he " not in combined
 
