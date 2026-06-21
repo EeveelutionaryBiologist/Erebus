@@ -22,6 +22,7 @@ from librarian import (
     librarian_summarize,
     librarian_should_merge,
     librarian_split_compound,
+    librarian_check_supersession,
 )
 from knowledge_graph import KnowledgeRelationshipGraph
 
@@ -92,11 +93,13 @@ def init_sqlite():
             last_accessed DATETIME
         );
         CREATE TABLE IF NOT EXISTS atomic_facts (
-            id          TEXT PRIMARY KEY,
-            content     TEXT NOT NULL,
-            hit_count   INTEGER DEFAULT 0,
-            created_at  DATETIME,
-            last_accessed DATETIME
+            id              TEXT PRIMARY KEY,
+            content         TEXT NOT NULL,
+            hit_count       INTEGER DEFAULT 0,
+            temporal_status TEXT DEFAULT 'current',
+            valid_period    TEXT,
+            created_at      DATETIME,
+            last_accessed   DATETIME
         );
         CREATE TABLE IF NOT EXISTS entities (
             id             TEXT PRIMARY KEY,
@@ -173,6 +176,15 @@ def _migrate_to_v2():
         _migrate_kg_nodes(cursor)
         sqlite_conn.commit()
 
+    # Add temporal columns to atomic_facts if absent (idempotent — safe to run every startup).
+    cursor.execute("PRAGMA table_info(atomic_facts)")
+    existing_cols = {row[1] for row in cursor.fetchall()}
+    if "temporal_status" not in existing_cols:
+        cursor.execute("ALTER TABLE atomic_facts ADD COLUMN temporal_status TEXT DEFAULT 'current'")
+    if "valid_period" not in existing_cols:
+        cursor.execute("ALTER TABLE atomic_facts ADD COLUMN valid_period TEXT")
+    sqlite_conn.commit()
+
 # ---------------------------------------------------------------------------
 # Write-time normalization
 # ---------------------------------------------------------------------------
@@ -240,6 +252,21 @@ HIGH_SIM_DEDUP_THRESHOLD = 0.99
 # almost always already atomic, so skip the Librarian call to save CPU).
 COMPOUND_CHECK_MIN_CHARS = 120
 
+# Phase 4 (Supersession / Contradiction)
+# Maps a past-tense predicate to its present-tense counterpart. When both exist for the
+# same (subject, object) entity pair, the past-tense edge's source facts are marked historical.
+TEMPORAL_PREDICATE_PAIRS: dict[str, str] = {
+    "WAS": "IS",
+    "HAD": "HAS",
+}
+
+# Predicate pairs that represent direct logical contradiction (no temporal ordering implied).
+# Both source fact sets are added to report["flagged"] for human review.
+CONTRADICTION_PREDICATE_PAIRS: list[tuple[str, str]] = [
+    ("IS", "IS_NOT"),
+    ("HAS", "HAS_NOT"),
+]
+
 # ==========================================
 # 5. API ENDPOINTS
 # ==========================================
@@ -274,16 +301,19 @@ def add_memory(memory: MemoryInput):
     for fact in processed_data.atomic_facts:
         fact_id = str(uuid.uuid4())
         fact_ids_batch.append(fact_id)
-        vector = get_embedding(fact)
+        vector = get_embedding(fact.text)
 
-        collection.add(embeddings=[vector], documents=[fact], ids=[fact_id])
+        collection.add(embeddings=[vector], documents=[fact.text], ids=[fact_id])
         cursor.execute(
-            "INSERT INTO atomic_facts (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
-            (fact_id, fact, now, now)
+            "INSERT INTO atomic_facts "
+            "(id, content, temporal_status, valid_period, created_at, last_accessed) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (fact_id, fact.text, fact.temporal_status, fact.valid_period, now, now)
         )
     sqlite_conn.commit()
 
-    # 4. Save Triples to Knowledge Graph, linked to this batch's fact IDs
+    # 4. Save Triples to Knowledge Graph, linked to this batch's fact IDs.
+    # persist=False defers the disk write; we flush once after the loop.
     for triple in processed_data.triples:
         subj = normalize_entity_name(triple.subject)
         obj  = normalize_entity_name(triple.object)
@@ -293,9 +323,12 @@ def add_memory(memory: MemoryInput):
         knowledge_graph.add_relationship(
             subject_id, pred, object_id,
             subject_name=subj, object_name=obj,
-            fact_ids=fact_ids_batch
+            fact_ids=fact_ids_batch,
+            persist=False,
         )
         print(f"  -> Graph Mapped: {subj} [{pred}] {obj}")
+    if processed_data.triples:
+        knowledge_graph.write_graph()
     
     return {
         "status": "success", 
@@ -393,11 +426,17 @@ def context_memory(search: SearchQuery):
     final_results = []
     if results["ids"] and results["ids"][0]:
         for mem_id in results["ids"][0]:
+            # Only surface current facts; historical facts remain in ChromaDB for temporal queries
+            # but are excluded from the fast-path context window.
             cursor.execute(
-                "UPDATE atomic_facts SET hit_count = hit_count + 1, last_accessed = ? WHERE id = ?",
+                "UPDATE atomic_facts SET hit_count = hit_count + 1, last_accessed = ? "
+                "WHERE id = ? AND temporal_status = 'current'",
                 (now, mem_id),
             )
-            cursor.execute("SELECT content, hit_count FROM atomic_facts WHERE id = ?", (mem_id,))
+            cursor.execute(
+                "SELECT content, hit_count FROM atomic_facts WHERE id = ? AND temporal_status = 'current'",
+                (mem_id,),
+            )
             row = cursor.fetchone()
             if row:
                 final_results.append({"text": row[0], "hit_count": row[1]})
@@ -473,23 +512,114 @@ def clear_all_memories():
 @app.post("/memory/consolidate")
 def consolidate_memories():
     """
-    Three-phase memory hygiene pass:
+    Four-phase memory hygiene pass:
+      Phase 0 – Exact dedup: collapse identical fact text to a single row.
       Phase 1 – Prune: delete stale, never-retrieved atomic facts from ChromaDB + SQLite.
       Phase 2 – Merge: detect near-duplicate fact pairs via cosine similarity; ask the
                        Librarian to produce a merged fact and replace the originals.
-      Phase 3 – Split: find compound facts that slipped through the write-time atomization
-                       and break them into truly independent sentences.
+      Phase 3 – Split: find compound facts and break them into atomic sentences.
+      Phase 4 – Supersession/Contradiction: scan KG edges for IS/WAS (and IS/IS_NOT) pairs
+                       on the same entity pair. WAS source facts are marked 'historical';
+                       opposing predicates are flagged for review.
 
     KG source tracking: each KG edge stores source_fact_ids. Deleting a fact calls
     knowledge_graph.remove_fact_reference(), which removes it from all edges and deletes
     edges whose source list becomes empty. Legacy edges (no source_fact_ids) are left
     in place and cleaned up by the degree=0 orphan sweep at the end of each pass.
     """
-    report = {"pruned": 0, "merged": 0, "split": 0, "errors": []}
+    report = {"pruned": 0, "merged": 0, "split": 0, "superseded": 0, "flagged": [], "errors": []}
     cursor = sqlite_conn.cursor()
     now = datetime.now().isoformat()
 
+    # Tracks contradiction pairs already added to report["flagged"] so multi-pass doesn't duplicate.
+    flagged_pairs: set[tuple[str, str, str, str]] = set()
+    # Fact IDs involved in a detected contradiction — protected from Phase 2 dedup since they
+    # are intentionally distinct facts, not duplicates.
+    protected_fact_ids: set[str] = set()
+
     for _N in range(CONSOLIDATION_PASSES):
+        # ------------------------------------------------------------------
+        # Phase 4: Structural supersession and contradiction detection via KG
+        # Runs first so Phase 2 cannot destroy IS/WAS or IS/IS_NOT pairs before we inspect them.
+        # ------------------------------------------------------------------
+        print("[CONSOLIDATE] Phase 4: Structural supersession/contradiction detection...")
+
+        for subject_id in list(knowledge_graph.G.nodes()):
+            for object_id in list(knowledge_graph.G.successors(subject_id)):
+                if not knowledge_graph.G.has_edge(subject_id, object_id):
+                    continue
+                edges = knowledge_graph.G[subject_id][object_id]
+
+                # Index edge data by predicate for fast membership tests.
+                predicate_map: dict[str, list[dict]] = {}
+                for _k, data in edges.items():
+                    pred = data.get("relation", "")
+                    predicate_map.setdefault(pred, []).append(data)
+
+                subj_name = knowledge_graph.G.nodes[subject_id].get("name", subject_id)
+                obj_name = knowledge_graph.G.nodes[object_id].get("name", object_id)
+
+                # Supersession: past-tense predicate coexists with its present-tense counterpart.
+                for past_pred, present_pred in TEMPORAL_PREDICATE_PAIRS.items():
+                    if past_pred not in predicate_map or present_pred not in predicate_map:
+                        continue
+                    for edge_data in predicate_map[past_pred]:
+                        for fact_id in edge_data.get("source_fact_ids", []):
+                            cursor.execute(
+                                "SELECT temporal_status FROM atomic_facts WHERE id = ?", (fact_id,)
+                            )
+                            row = cursor.fetchone()
+                            if row and row[0] != "historical":
+                                cursor.execute(
+                                    "UPDATE atomic_facts SET temporal_status = 'historical' WHERE id = ?",
+                                    (fact_id,),
+                                )
+                                report["superseded"] += 1
+                                print(
+                                    f"[CONSOLIDATE] Superseded: {subj_name} [{past_pred}] {obj_name} "
+                                    f"(fact {fact_id[:8]}…) overridden by [{present_pred}] edge."
+                                )
+
+                # Contradiction: opposing predicates — flag for human review, no auto-resolution.
+                for pred_a, pred_b in CONTRADICTION_PREDICATE_PAIRS:
+                    if pred_a not in predicate_map or pred_b not in predicate_map:
+                        continue
+                    pair_key = (subject_id, object_id, pred_a, pred_b)
+                    if pair_key in flagged_pairs:
+                        continue
+                    flagged_pairs.add(pair_key)
+                    facts_a = []
+                    for edge_data in predicate_map[pred_a]:
+                        for fact_id in edge_data.get("source_fact_ids", []):
+                            protected_fact_ids.add(fact_id)
+                            cursor.execute("SELECT content FROM atomic_facts WHERE id = ?", (fact_id,))
+                            row = cursor.fetchone()
+                            if row:
+                                facts_a.append(row[0])
+                    facts_b = []
+                    for edge_data in predicate_map[pred_b]:
+                        for fact_id in edge_data.get("source_fact_ids", []):
+                            protected_fact_ids.add(fact_id)
+                            cursor.execute("SELECT content FROM atomic_facts WHERE id = ?", (fact_id,))
+                            row = cursor.fetchone()
+                            if row:
+                                facts_b.append(row[0])
+                    if facts_a and facts_b:
+                        report["flagged"].append({
+                            "type": "contradiction",
+                            "subject": subj_name,
+                            "object": obj_name,
+                            "predicate_a": pred_a,
+                            "predicate_b": pred_b,
+                            "facts_a": facts_a,
+                            "facts_b": facts_b,
+                        })
+                        print(
+                            f"[CONSOLIDATE] Contradiction: {subj_name} [{pred_a}] vs [{pred_b}] {obj_name}"
+                        )
+
+        sqlite_conn.commit()
+
         # ------------------------------------------------------------------
         # Phase 0: Exact-text dedup within atomic_facts
         # ------------------------------------------------------------------
@@ -577,6 +707,17 @@ def consolidate_memories():
                         continue
                     sim = float(similarity_matrix[i, j])
                     if sim < DEDUP_SIMILARITY_THRESHOLD:
+                        continue
+
+                    # Skip contradiction-flagged facts and any fact already marked historical.
+                    # Historical facts are archived versions — never dedup candidates.
+                    if ids[i] in protected_fact_ids or ids[j] in protected_fact_ids:
+                        continue
+                    cursor.execute("SELECT temporal_status FROM atomic_facts WHERE id = ?", (ids[i],))
+                    status_i = (cursor.fetchone() or ("current",))[0]
+                    cursor.execute("SELECT temporal_status FROM atomic_facts WHERE id = ?", (ids[j],))
+                    status_j = (cursor.fetchone() or ("current",))[0]
+                    if "historical" in (status_i, status_j):
                         continue
 
                     if sim >= HIGH_SIM_DEDUP_THRESHOLD:

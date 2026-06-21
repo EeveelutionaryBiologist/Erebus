@@ -1,8 +1,9 @@
 import json
 from pathlib import Path
+from typing import Literal
 from llama_cpp import Llama
 from huggingface_hub import hf_hub_download, snapshot_download
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # TODO: Move this to a config file
 MUCH_RAM = True
@@ -31,11 +32,31 @@ class KnowledgeTriple(BaseModel):
     predicate: str = Field(description="The relationship (e.g., 'HAS', 'IS', 'MOTHER_OF')")
     object: str = Field(description="The target entity (e.g., 'Mochi')")
 
+class AtomicFact(BaseModel):
+    text: str = Field(description="A single, standalone sentence with all pronouns resolved.")
+    temporal_status: Literal["current", "historical", "uncertain"] = Field(
+        default="current",
+        description="'current' for present-tense facts, 'historical' for explicitly past or outdated facts, 'uncertain' if the tense is ambiguous."
+    )
+    valid_period: str | None = Field(
+        default=None,
+        description="Optional free-text period when this fact was true (e.g., 'during college', '2010-2015')."
+    )
+
 class MemoryProcessing(BaseModel):
-    atomic_facts: list[str] = Field(
-        description="A list of standalone, independent sentences extracted from the text. All pronouns must be replaced with the actual entity names so the sentence makes sense in isolation."
+    atomic_facts: list[AtomicFact] = Field(
+        description="A list of standalone, independent sentences extracted from the text. "
+        "All pronouns must be replaced with the actual entity names so each sentence makes sense in isolation."
     )
     triples: list[KnowledgeTriple]
+
+    @field_validator("atomic_facts", mode="before")
+    @classmethod
+    def _coerce_strings(cls, v):
+        """Accept plain strings for backward compatibility with tests and legacy code."""
+        if isinstance(v, list):
+            return [AtomicFact(text=x) if isinstance(x, str) else x for x in v]
+        return v
 
 class MergeDecision(BaseModel):
     should_merge: bool
@@ -49,6 +70,13 @@ class SplitDecision(BaseModel):
     split_facts: list[str] = Field(
         default_factory=list,
         description="The atomic sub-facts if is_compound is True. Empty list if False."
+    )
+
+class SupersessionDecision(BaseModel):
+    outcome: Literal["A_supersedes_B", "B_supersedes_A", "contradiction", "neither"]
+    explanation: str = Field(
+        default="",
+        description="Brief explanation of the relationship between the two facts."
     )
 
 # --- FUNCTIONS ---
@@ -88,10 +116,19 @@ def process_memory_chunk(text: str) -> MemoryProcessing:
     system_prompt = (
         "You are an advanced data extraction AI. You have two tasks:\n"
         "1. Extract 'atomic_facts': Break the text into independent, single-fact sentences. "
-        "CRITICAL: Resolve all pronouns by finding the antecedent in the full text before writing each fact."
-        "Example input: 'Alice has a cat. She loves it.'"
-        "Example output atomic_facts: ['Alice has a cat.', 'Alice loves the cat.']"
-        "Never output a fact containing 'she', 'he', 'it', 'they', 'her', 'him', 'them'."
+        "CRITICAL: Resolve all pronouns by finding the antecedent in the full text before writing each fact. "
+        "Example input: 'Alice has a cat. She loves it.' "
+        "Example output: [{\"text\": \"Alice has a cat.\", \"temporal_status\": \"current\"}, "
+        "{\"text\": \"Alice loves the cat.\", \"temporal_status\": \"current\"}] "
+        "Never output a fact containing 'she', 'he', 'it', 'they', 'her', 'him', 'them'. "
+        "Set temporal_status to 'historical' for facts stated in past tense or described as no longer true "
+        "(e.g., 'She used to be a fencer', 'He was a teacher in 2010'). "
+        "Set temporal_status to 'current' for present-tense or timeless facts. "
+        "Set temporal_status to 'uncertain' only when the temporal state is genuinely ambiguous. "
+        "Set valid_period to a short phrase when a time window is mentioned (e.g., 'during college', '2010–2015'); "
+        "otherwise leave it null.\n"
+        "2. Extract 'triples': Subject-predicate-object relationships from the text. "
+        "Use past-tense predicates (WAS, HAD) for historical facts and present-tense (IS, HAS) for current ones."
     )
     
     print(f"[LIBRARIAN] Processing chunk for DBs: '{text[:50]}...'")
@@ -194,6 +231,43 @@ def librarian_split_compound(fact: str) -> SplitDecision | None:
         return SplitDecision(**json.loads(response['choices'][0]['message']['content']))
     except Exception as e:
         print(f"[LIBRARIAN ERROR] Split decision failed: {e}")
+        return None
+
+
+def librarian_check_supersession(fact_a: str, fact_b: str) -> SupersessionDecision | None:
+    """Determines whether two facts are in a supersession or contradiction relationship.
+
+    Intended for cases where structural predicate detection (IS/WAS graph pairing) is insufficient —
+    e.g., same predicate but one fact contains 'no longer' or 'used to' in the text itself.
+    """
+    if librarian_llm is None:
+        raise ValueError("Librarian model not loaded.")
+
+    system_prompt = (
+        "You are a fact-relationship analyzer. Given two facts about the same or similar subject, "
+        "classify their relationship:\n"
+        "- 'A_supersedes_B': Fact A is a more recent update, making Fact B outdated.\n"
+        "- 'B_supersedes_A': Fact B is more recent, making Fact A outdated.\n"
+        "- 'contradiction': The facts are directly incompatible and you cannot determine which is newer.\n"
+        "- 'neither': The facts are compatible, cover different aspects, or are unrelated.\n\n"
+        "Use supersession when tense or temporal language ('used to', 'no longer', 'now') implies ordering. "
+        "Use 'contradiction' only for direct factual incompatibility without clear temporal ordering. "
+        "When in doubt, use 'neither'."
+    )
+
+    response = librarian_llm.create_chat_completion(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f'Fact A: "{fact_a}"\nFact B: "{fact_b}"'},
+        ],
+        response_format={"type": "json_object", "schema": SupersessionDecision.model_json_schema()},
+        temperature=0.1,
+    )
+
+    try:
+        return SupersessionDecision(**json.loads(response["choices"][0]["message"]["content"]))
+    except Exception as e:
+        print(f"[LIBRARIAN ERROR] Supersession check failed: {e}")
         return None
 
 

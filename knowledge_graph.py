@@ -79,12 +79,16 @@ class KnowledgeRelationshipGraph:
 
     def add_relationship(self, subject_id: str, predicate: str, object_id: str,
                          subject_name: str, object_name: str,
-                         fact_ids: list[str] | None = None):
+                         fact_ids: list[str] | None = None,
+                         persist: bool = True):
         """Adds or updates a directed edge between two entity UUID nodes.
 
         If an edge with the same predicate already exists between this pair, the
         new fact_ids are appended to it (preserving the existing relationship).
         A genuinely different predicate gets its own edge (MultiDiGraph behaviour).
+
+        Set persist=False when calling in a tight loop and flush with write_graph()
+        once at the end to avoid serialising the full graph on every triple.
         """
         self.G.add_node(subject_id, name=subject_name)
         self.G.add_node(object_id, name=object_name)
@@ -119,7 +123,8 @@ class KnowledgeRelationshipGraph:
                         (subject_id, object_id, new_key)
                     )
 
-        self.write_graph()
+        if persist:
+            self.write_graph()
 
     def rebuild_with_name_to_id_mapping(self, name_to_id: dict[str, str]) -> None:
         """Replaces string node keys with UUID keys. Used for the v2 schema migration."""
