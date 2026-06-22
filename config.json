@@ -1,0 +1,22 @@
+{
+  "MUCH_RAM": true,
+  "USE_GPU": false,
+  "LOCAL_MODEL": true,
+  
+  "GEMINI": {
+    "BASE_URL": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "MODEL_NAME": "gemini-3.1-flash-lite"
+  },
+  "OPENAI": {
+    "BASE_URL": "",
+    "MODEL_NAME": ""
+  },
+  "ANTHROPIC": {
+    "BASE_URL": "",
+    "MODEL_NAME": ""
+  },
+  "OLLAMA": {
+    "BASE_URL": "http://localhost:11434/v1",
+    "MODEL_NAME": ""
+  }
+}
