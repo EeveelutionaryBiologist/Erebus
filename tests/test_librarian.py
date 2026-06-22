@@ -17,9 +17,9 @@ import pytest
 
 @pytest.fixture(scope="module")
 def librarian():
-    """Load the Librarian model once for the whole module (slow ~30s startup)."""
-    from librarian import load_librarian_model, librarian_llm
-    load_librarian_model()
+    """Load the LLM backend once for the whole module (slow ~30s startup)."""
+    from llm_client import load_llm_client
+    load_llm_client()
     import librarian as lib
     return lib
 

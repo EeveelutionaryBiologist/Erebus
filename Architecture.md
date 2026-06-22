@@ -32,16 +32,32 @@ IMPORTANT NOTE: Any and all data currently held in databases / knowledge graphs 
 
 A second temporal graph (`KnowledgeGraph/temporal_graph.json`) is planned (see Roadmap below).
 
+#### LLM Client
+
+`llm_client.py` owns all model loading and inference routing. A single `load_llm_client()` call at startup selects a backend and initializes it; every subsequent call uses `get_llm_client()`. Provider selection order (first match wins):
+
+1. `LOCAL_MODEL: true` in `config.json` → local llama_cpp Qwen (explicit override)
+2. `GOOGLE_API_KEY` env + `GOOGLE.MODEL_NAME` in config → Google Gemini
+3. `OPENAI_API_KEY` + `OPENAI.MODEL_NAME` → OpenAI
+4. `ANTHROPIC_API_KEY` + `ANTHROPIC.MODEL_NAME` → Anthropic (via OpenAI-compatible proxy)
+5. `OLLAMA.BASE_URL` + `OLLAMA.MODEL_NAME` in config → Ollama (no key needed)
+6. Fallback → local llama_cpp Qwen
+
+Two backend classes share the same interface (`chat_json`, `chat_text`):
+- `_LocalBackend` — llama_cpp, grammar-constrained JSON via the `"schema"` extension on `response_format`. Model variant (3B / 7B) and GPU layers read from `MUCH_RAM` / `USE_GPU` in `config.json`.
+- `_OpenAICompatibleBackend` — openai SDK, `json_schema` response format (strict omitted — Pydantic optional fields are incompatible with OpenAI strict-mode client-side validation).
+
+The BGE embedding model always runs locally via llama_cpp regardless of the Librarian backend.
+
 #### Librarian
 
-LLM-based routine (`librarian.py`) that handles:
-- Atomic fact extraction with temporal tagging (`process_memory_chunk()`)
-- Entity identification from queries (`extract_entities_from_text()`)
-- Near-duplicate merge decisions (`librarian_should_merge()`)
-- Compound fact splitting (`librarian_split_compound()`)
-- Supersession / contradiction classification (`librarian_check_supersession()`, not yet wired into Phase 4)
-
-Controlled by `MUCH_RAM` flag: `True` → Qwen2.5-7B-Instruct (two GGUF shards); `False` → Qwen2.5-3B-Instruct.
+`librarian.py` owns all inference prompts and Pydantic output schemas. It has no llama_cpp dependency — all calls go through `get_llm_client()`. Functions:
+- `process_memory_chunk()` — atomic fact extraction with temporal tagging
+- `extract_entities_from_text()` — entity identification from search queries
+- `librarian_should_merge()` — near-duplicate merge decisions
+- `librarian_split_compound()` — compound fact splitting
+- `librarian_check_supersession()` — supersession / contradiction classification (not yet wired into Phase 4)
+- `extract_context_hint()` — subject + time_period extraction for cross-chunk pronoun resolution in `/learn`
 
 #### Notable API Endpoints
 
@@ -79,7 +95,7 @@ Wipes ChromaDB collection, all SQLite tables, and the knowledge graph.
 - [x] O(1) fact→edge index (`_fact_edge_index`)
 - [x] MultiDiGraph (multiple predicates per entity pair)
 - [x] Graph write batching (`persist=False` + `write_graph()` flush at end of `/memory/add`)
-- [x] Test infrastructure (pytest, conftest, 71 passing non-model tests)
+- [x] Test infrastructure (pytest, conftest, 88 passing non-model tests)
 - [x] Entity/predicate normalization at write time (title-case names, uppercase + synonym-map predicates)
 - [x] `POST /memory/context` fast-path endpoint (no Librarian, vector-only, <100ms, `current` facts only)
 - [x] Split `GET /memory/all` by type (`?type=raw|fact|entity`)

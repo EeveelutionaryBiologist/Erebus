@@ -97,7 +97,7 @@ def app_client(tmp_path, monkeypatch):
     # Stub model loading so startup_event never tries to read GGUF files
     monkeypatch.setattr(memory_server, "Llama", MagicMock)
     monkeypatch.setattr(memory_server, "hf_hub_download", MagicMock())
-    monkeypatch.setattr(memory_server, "load_librarian_model", MagicMock())
+    monkeypatch.setattr(memory_server, "load_llm_client", MagicMock())
 
     # Default: no context hint (tests that need hint behaviour override this)
     monkeypatch.setattr(memory_server, "extract_context_hint", lambda text: None)

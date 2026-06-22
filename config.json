@@ -1,7 +1,7 @@
 {
   "MUCH_RAM": true,
   "USE_GPU": false,
-  "LOCAL_MODEL": true,
+  "LOCAL_MODEL": false,
   
   "GOOGLE": {
     "BASE_URL": "https://generativelanguage.googleapis.com/v1beta/openai/",

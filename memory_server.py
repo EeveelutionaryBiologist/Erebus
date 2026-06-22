@@ -15,8 +15,8 @@ import chromadb
 from llama_cpp import Llama
 from huggingface_hub import hf_hub_download
 
+from llm_client import load_llm_client
 from librarian import (
-    load_librarian_model,
     process_memory_chunk,
     extract_entities_from_text,
     extract_context_hint,
@@ -70,8 +70,8 @@ def startup_event():
     print("[SYSTEM] Initializing Llama.cpp Embedder...")
     embedder = Llama(model_path=str(GGUF_MODEL_PATH), embedding=True, verbose=False)
     
-    # Load background Librarian
-    load_librarian_model()
+    # Load LLM backend (local Qwen or cloud provider per config.json)
+    load_llm_client()
     _migrate_to_v2()
 
 def get_embedding(text: str) -> list[float]:
