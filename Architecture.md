@@ -95,23 +95,22 @@ Wipes ChromaDB collection, all SQLite tables, and the knowledge graph.
 - [x] O(1) fact→edge index (`_fact_edge_index`)
 - [x] MultiDiGraph (multiple predicates per entity pair)
 - [x] Graph write batching (`persist=False` + `write_graph()` flush at end of `/memory/add`)
-- [x] Test infrastructure (pytest, conftest, 88 passing non-model tests)
+- [x] Test infrastructure (pytest, conftest, 98 passing non-model tests)
 - [x] Entity/predicate normalization at write time (title-case names, uppercase + synonym-map predicates)
 - [x] `POST /memory/context` fast-path endpoint (no Librarian, vector-only, <100ms, `current` facts only)
 - [x] Split `GET /memory/all` by type (`?type=raw|fact|entity`)
 - [x] Layer 1 temporal resolution: `AtomicFact` model with `temporal_status` + `valid_period`; column migration in SQLite; Librarian prompt updated to tag tense at parse time
 - [x] Phase 4 consolidation: structural supersession (IS/WAS edge pairs → mark WAS source facts `historical`) and contradiction detection (IS/IS_NOT edge pairs → flag for review). Phase 4 runs before Phase 2 to prevent embedding dedup from consuming opposing-predicate pairs.
+- [x] **`POST /memory/learn` endpoint** — Splits large text into sentence-boundary chunks (`LEARN_CHUNK_SIZE = 5`, no overlap) and feeds each through the `/add` pipeline. Returns `{chunks_total, chunks_succeeded, facts_added, triples_added, errors}`. Context hint (`ContextHint`: subject + time_period) extracted from chunk 0 and prepended as `[CONTEXT: ...]` to subsequent chunks for cross-chunk pronoun resolution.
+- [x] **Async memory operations** — `/add`, `/learn`, `/consolidate` return HTTP 202 + `{task_id, status:"pending"}` immediately. `GET /memory/task/{task_id}` polls status/result/error. Each background task opens its own SQLite connection (WAL mode). `_run_task_in_background` is monkeypatched to synchronous in tests.
+- [x] **Unified LLM client** (`llm_client.py`) — Config-driven provider selection: local Qwen (llama_cpp) or any OpenAI-compatible cloud endpoint (Google Gemini, OpenAI, Ollama). `librarian.py` routes all inference through `get_llm_client()` with no llama_cpp dependency of its own.
 
 #### Next / In Progress
+
+- [ ] **`librarian_check_supersession()` activation** — The function exists in `librarian.py` and is already imported in `memory_server.py` but Phase 4 currently uses only structural graph detection. Wire it in for same-predicate pairs where the fact text contains supersession language ("no longer", "used to") but no opposing predicate exists in the KG.
+
+- [ ] **Source chunk linkage** — Add `source_chunk_id TEXT REFERENCES raw_chunks(id)` to `atomic_facts` so each fact can be traced back to the verbatim text that produced it. For `entities`, add a many-to-many `entity_chunks` join table (`entity_id`, `chunk_id`) since the same entity can appear across many chunks. Populate both at write time in `_add_memory_sync()`. Expose on `/memory/search` and `/memory/all` responses. Requires a `_migrate_to_v3()` startup migration (ALTER TABLE for `atomic_facts`; CREATE TABLE for `entity_chunks`; existing rows get NULL / empty).
 
 - [ ] **Tags / Groups** — Thematic clusters that can be applied to entities, facts, or both. An entity can belong to multiple groups (e.g., "University", "Friends"). During `/memory/add`, a Librarian call should decide whether the entity fits an existing group or warrants a new one. Groups should be persisted (SQLite `groups` table + a many-to-many `entity_groups` join table) and surfaced on `/memory/search` and `/memory/context` results. Open questions: should facts be group-tagged independently of their entities, or inherit group membership from their entities?
 
 - [ ] **Temporal relationship graph (Layer 2)** — A second `KnowledgeGraph/temporal_graph.json` using the same `KnowledgeRelationshipGraph` class. Nodes are state-instances (not bare entities); edges are `CAUSED`, `PRECEDED_BY`, `CONCURRENT_WITH`. Populated by Phase 4 supersession detection results. Enables `nx.ancestors()` / `nx.descendants()` traversal in `/memory/search` for transitive causal context ("if A caused B and B caused C, then C was implicitly caused by A").
-
-- [ ] **Async consolidation** — `POST /memory/consolidate` is synchronous and will block/time out on large collections. Move to FastAPI `BackgroundTask` with a status endpoint.
-
-- [ ] **`librarian_check_supersession()` activation** — The function exists in `librarian.py` but Phase 4 currently uses only structural graph detection. Future: call it for same-predicate pairs where the fact text contains supersession language ("no longer", "used to") but no opposing predicate exists in the KG.
-
-- [x] **`POST /learn` endpoint** — Splits large text into sentence-boundary chunks (`LEARN_CHUNK_SIZE = 5`, no overlap) and feeds each through the `/add` pipeline. Returns `{chunks_total, chunks_succeeded, facts_added, triples_added, errors}`. Partial success is reported as `status: "partial"` with per-chunk error details. No overlap is used to avoid duplicate ingestion; cross-sentence pronoun resolution within a chunk is handled by Librarian context.
-
-- [ ] **Async memory operations** — `/add`, `/learn`, and `/consolidate` all block the server during Librarian inference (30s+ for large inputs or consolidation passes). All three should be moved to `BackgroundTask` (or a task queue) so the server remains responsive. Each should return a task ID immediately, with a `GET /memory/task/{id}` status endpoint to poll for completion.
