@@ -21,12 +21,22 @@ def load_environment_dict() -> dict:
     return data
 
 
-config_dict = load_environment_dict()
-print(config_dict)
+def obtain_client():
+    config_dict = load_environment_dict()
 
-for provider in PROVIDERS:
-    key_name = f"{provider}_API_KEY"
-    api_key = os.environ.get(key_name)
+    for provider in PROVIDERS:
+        key_name = f"{provider}_API_KEY"
+        api_key = os.environ.get(key_name)
 
-    if not key_name:
-        continue
+        if not key_name:
+            continue
+
+        base_url = config_dict.get(provider).get("BASE_URL")
+        model_name = config_dict.get(provider).get("MODEL_NAME")
+
+        # TODO setup client
+        pass
+
+        # TODO Fallback to llama_cpp local Qwen
+        pass
+

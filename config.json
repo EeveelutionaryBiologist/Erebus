@@ -3,7 +3,7 @@
   "USE_GPU": false,
   "LOCAL_MODEL": true,
   
-  "GEMINI": {
+  "GOOGLE": {
     "BASE_URL": "https://generativelanguage.googleapis.com/v1beta/openai/",
     "MODEL_NAME": "gemini-3.1-flash-lite"
   },
