@@ -102,5 +102,13 @@ def app_client(tmp_path, monkeypatch):
     # Default: no context hint (tests that need hint behaviour override this)
     monkeypatch.setattr(memory_server, "extract_context_hint", lambda text: None)
 
+    # Run background tasks synchronously so side effects are committed before
+    # the HTTP response arrives. Tests that check task results use wait_for_task().
+    monkeypatch.setattr(
+        memory_server,
+        "_run_task_in_background",
+        lambda task_id, fn, *args, **kwargs: memory_server._execute_task(task_id, fn, *args, **kwargs),
+    )
+
     with TestClient(memory_server.app) as client:
         yield client

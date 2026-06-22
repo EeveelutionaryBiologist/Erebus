@@ -2,12 +2,12 @@ import re
 import json
 import uuid
 import sqlite3
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, Literal
 
 import numpy as np
-
-from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -86,6 +86,7 @@ knowledge_graph = KnowledgeRelationshipGraph(str(GRAPH_DIR / "knowledge_graph.js
 # ==========================================
 def init_sqlite():
     conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
     cursor = conn.cursor()
     cursor.executescript("""
         CREATE TABLE IF NOT EXISTS raw_chunks (
@@ -212,9 +213,10 @@ def normalize_predicate(pred: str) -> str:
 
 # ---------------------------------------------------------------------------
 
-def get_or_create_entity(name: str) -> str:
+def get_or_create_entity(name: str, conn: sqlite3.Connection | None = None) -> str:
     """Returns the entity UUID for `name`, inserting a new row if it doesn't exist."""
-    cursor = sqlite_conn.cursor()
+    c = (conn or sqlite_conn)
+    cursor = c.cursor()
     cursor.execute("SELECT id FROM entities WHERE LOWER(canonical_name) = LOWER(?)", (name,))
     row = cursor.fetchone()
     if row:
@@ -226,7 +228,7 @@ def get_or_create_entity(name: str) -> str:
         "VALUES (?, ?, '[]', 0, ?, ?)",
         (entity_id, name, now, now)
     )
-    sqlite_conn.commit()
+    c.commit()
     return entity_id
 
 def lookup_entity(name: str) -> str | None:
@@ -273,7 +275,80 @@ CONTRADICTION_PREDICATE_PAIRS: list[tuple[str, str]] = [
 ]
 
 # ==========================================
-# 5. API ENDPOINTS
+# 5. ASYNC TASK INFRASTRUCTURE
+# ==========================================
+
+_task_registry: dict[str, dict[str, Any]] = {}
+_task_lock = threading.Lock()
+
+
+def _create_task() -> str:
+    task_id = str(uuid.uuid4())
+    with _task_lock:
+        _task_registry[task_id] = {
+            "task_id": task_id,
+            "status": "pending",
+            "created_at": datetime.now().isoformat(),
+            "completed_at": None,
+            "result": None,
+            "error": None,
+        }
+    return task_id
+
+
+def _execute_task(task_id: str, fn, *args, **kwargs):
+    """Run fn(*args, conn=conn, **kwargs) in the caller's thread, updating task registry."""
+    with _task_lock:
+        _task_registry[task_id]["status"] = "running"
+    conn = sqlite3.connect(str(SQLITE_PATH), check_same_thread=False)
+    try:
+        result = fn(*args, conn=conn, **kwargs)
+        with _task_lock:
+            _task_registry[task_id].update({
+                "status": "completed",
+                "result": result,
+                "completed_at": datetime.now().isoformat(),
+            })
+    except HTTPException as e:
+        with _task_lock:
+            _task_registry[task_id].update({
+                "status": "failed",
+                "error": e.detail,
+                "completed_at": datetime.now().isoformat(),
+            })
+    except Exception as e:
+        with _task_lock:
+            _task_registry[task_id].update({
+                "status": "failed",
+                "error": str(e),
+                "completed_at": datetime.now().isoformat(),
+            })
+    finally:
+        conn.close()
+
+
+def _run_task_in_background(task_id: str, fn, *args, **kwargs):
+    """Dispatch fn to a daemon thread; call _execute_task (monkeypatch this in tests)."""
+    threading.Thread(
+        target=_execute_task,
+        args=(task_id, fn) + args,
+        kwargs=kwargs,
+        daemon=True,
+    ).start()
+
+
+@app.get("/memory/task/{task_id}")
+def get_task_status(task_id: str):
+    """Poll the status of a background task created by /add, /learn, or /consolidate."""
+    with _task_lock:
+        task = dict(_task_registry.get(task_id, {}))
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found.")
+    return task
+
+
+# ==========================================
+# 6. API ENDPOINTS
 # ==========================================
 _SENTENCE_BOUNDARY = re.compile(r'(?<=[.!?])\s+')
 
@@ -294,12 +369,11 @@ class SearchQuery(BaseModel):
     query: str
     top_k: int = 3
 
-@app.post("/memory/add")
-def add_memory(memory: MemoryInput):
-    """Processes raw text via Librarian, saving Atomic facts to ChromaDB and Triples to Graph."""
+def _add_memory_sync(memory: MemoryInput, conn: sqlite3.Connection) -> dict:
+    """Synchronous core of /memory/add. Called by the background task runner."""
     now = datetime.now().isoformat()
-    cursor = sqlite_conn.cursor()
-    
+    cursor = conn.cursor()
+
     # 1. Ask Librarian to process the chunk
     processed_data = process_memory_chunk(memory.text)
     if not processed_data:
@@ -311,7 +385,7 @@ def add_memory(memory: MemoryInput):
         "INSERT INTO raw_chunks (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
         (raw_id, memory.text, now, now)
     )
-    sqlite_conn.commit()
+    conn.commit()
 
     # 3. Save Atomic Facts to ChromaDB & SQLite
     fact_ids_batch = []
@@ -327,7 +401,7 @@ def add_memory(memory: MemoryInput):
             "VALUES (?, ?, ?, ?, ?, ?)",
             (fact_id, fact.text, fact.temporal_status, fact.valid_period, now, now)
         )
-    sqlite_conn.commit()
+    conn.commit()
 
     # 4. Save Triples to Knowledge Graph, linked to this batch's fact IDs.
     # persist=False defers the disk write; we flush once after the loop.
@@ -335,8 +409,8 @@ def add_memory(memory: MemoryInput):
         subj = normalize_entity_name(triple.subject)
         obj  = normalize_entity_name(triple.object)
         pred = normalize_predicate(triple.predicate)
-        subject_id = get_or_create_entity(subj)
-        object_id  = get_or_create_entity(obj)
+        subject_id = get_or_create_entity(subj, conn=conn)
+        object_id  = get_or_create_entity(obj, conn=conn)
         knowledge_graph.add_relationship(
             subject_id, pred, object_id,
             subject_name=subj, object_name=obj,
@@ -346,7 +420,7 @@ def add_memory(memory: MemoryInput):
         print(f"  -> Graph Mapped: {subj} [{pred}] {obj}")
     if processed_data.triples:
         knowledge_graph.write_graph()
-    
+
     return {
         "status": "success",
         "message": f"Added {len(processed_data.atomic_facts)} standalone facts and {len(processed_data.triples)} graph relations.",
@@ -355,15 +429,19 @@ def add_memory(memory: MemoryInput):
     }
 
 
-@app.post("/memory/learn")
-def learn_from_source(memory: MemoryInput):
-    """Splits large text into sentence-boundary chunks and feeds each through /memory/add.
+@app.post("/memory/add", status_code=202)
+def add_memory(memory: MemoryInput):
+    """Enqueues text for Librarian processing. Returns a task handle immediately.
 
-    For multi-chunk inputs, the first chunk is passed to extract_context_hint() to produce a
-    short [CONTEXT: subject, time_period] prefix. This prefix is prepended to all subsequent
-    chunks before Librarian processing, grounding pronoun resolution and temporal tagging
-    across chunk boundaries. Works best for single-subject texts (biographies, diaries).
+    Poll GET /memory/task/{task_id} for status and results.
     """
+    task_id = _create_task()
+    _run_task_in_background(task_id, _add_memory_sync, memory)
+    return {"task_id": task_id, "status": "pending"}
+
+
+def _learn_from_source_sync(memory: MemoryInput, conn: sqlite3.Connection) -> dict:
+    """Synchronous core of /memory/learn. Called by the background task runner."""
     chunks = _split_into_chunks(memory.text, LEARN_CHUNK_SIZE)
     if not chunks:
         return {"status": "success", "chunks_total": 0, "chunks_succeeded": 0,
@@ -382,7 +460,7 @@ def learn_from_source(memory: MemoryInput):
     for i, chunk in enumerate(chunks):
         chunk_text = (context_prefix + chunk) if (context_prefix and i > 0) else chunk
         try:
-            result = add_memory(MemoryInput(text=chunk_text))
+            result = _add_memory_sync(MemoryInput(text=chunk_text), conn=conn)
             facts_added += result["facts_added"]
             triples_added += result["triples_added"]
         except HTTPException as e:
@@ -396,6 +474,19 @@ def learn_from_source(memory: MemoryInput):
         "triples_added": triples_added,
         "errors": errors,
     }
+
+
+@app.post("/memory/learn", status_code=202)
+def learn_from_source(memory: MemoryInput):
+    """Splits large text into sentence-boundary chunks and enqueues them for processing.
+
+    For multi-chunk inputs, a [CONTEXT: subject, time_period] prefix extracted from chunk 0
+    is prepended to chunks 1+ to ground pronoun resolution across chunk boundaries.
+    Poll GET /memory/task/{task_id} for status and results.
+    """
+    task_id = _create_task()
+    _run_task_in_background(task_id, _learn_from_source_sync, memory)
+    return {"task_id": task_id, "status": "pending"}
 
 @app.post("/memory/search")
 def search_memory(search: SearchQuery):
@@ -571,9 +662,9 @@ def clear_all_memories():
     return {"status": "success", "message": "All databases and graphs wiped clean."}
 
 
-@app.post("/memory/consolidate")
-def consolidate_memories():
-    """
+def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
+    """Synchronous core of /memory/consolidate. Called by the background task runner.
+
     Five-phase memory hygiene pass:
       Phase 0 – Exact dedup: collapse identical fact text to a single row.
       Phase 1 – Prune: delete stale, never-retrieved atomic facts from ChromaDB + SQLite.
@@ -590,7 +681,7 @@ def consolidate_memories():
     in place and cleaned up by the degree=0 orphan sweep at the end of each pass.
     """
     report = {"pruned": 0, "merged": 0, "split": 0, "superseded": 0, "flagged": [], "errors": []}
-    cursor = sqlite_conn.cursor()
+    cursor = conn.cursor()
     now = datetime.now().isoformat()
 
     # Tracks contradiction pairs already added to report["flagged"] so multi-pass doesn't duplicate.
@@ -680,7 +771,7 @@ def consolidate_memories():
                             f"[CONSOLIDATE] Contradiction: {subj_name} [{pred_a}] vs [{pred_b}] {obj_name}"
                         )
 
-        sqlite_conn.commit()
+        conn.commit()
 
         # ------------------------------------------------------------------
         # Phase 0: Exact-text dedup within atomic_facts
@@ -713,7 +804,7 @@ def consolidate_memories():
                 f"DELETE FROM atomic_facts WHERE id IN ({','.join('?' * len(drop_fact_ids))})",
                 drop_fact_ids
             )
-            sqlite_conn.commit()
+            conn.commit()
             report["merged"] += len(drop_fact_ids)
             print(f"[CONSOLIDATE] Exact-text dedup: dropped {len(drop_fact_ids)} copy/copies of '{content[:60]}'")
 
@@ -735,7 +826,7 @@ def consolidate_memories():
                 f"DELETE FROM atomic_facts WHERE id IN ({','.join('?' * len(stale_fact_ids))})",
                 stale_fact_ids
             )
-            sqlite_conn.commit()
+            conn.commit()
             for fact_id in stale_fact_ids:
                 knowledge_graph.remove_fact_reference(fact_id)
             report["pruned"] += len(stale_fact_ids)
@@ -795,7 +886,7 @@ def consolidate_memories():
                         drop_id = ids[j] if hits_i >= hits_j else ids[i]
                         collection.delete(ids=[drop_id])
                         cursor.execute("DELETE FROM atomic_facts WHERE id = ?", (drop_id,))
-                        sqlite_conn.commit()
+                        conn.commit()
                         knowledge_graph.remove_fact_reference(drop_id)
 
                         merged_out.add(ids[i])
@@ -812,7 +903,7 @@ def consolidate_memories():
                     # Remove both originals
                     collection.delete(ids=[ids[i], ids[j]])
                     cursor.execute("DELETE FROM atomic_facts WHERE id IN (?, ?)", (ids[i], ids[j]))
-                    sqlite_conn.commit()
+                    conn.commit()
                     knowledge_graph.remove_fact_reference(ids[i])
                     knowledge_graph.remove_fact_reference(ids[j])
 
@@ -828,7 +919,7 @@ def consolidate_memories():
                         "INSERT INTO atomic_facts (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
                         (merged_id, decision.merged_fact, now, now)
                     )
-                    sqlite_conn.commit()
+                    conn.commit()
 
                     merged_out.add(ids[i])
                     merged_out.add(ids[j])
@@ -872,7 +963,7 @@ def consolidate_memories():
                     (split_id, split_fact, now, now)
                 )
 
-            sqlite_conn.commit()
+            conn.commit()
             report["split"] += 1
             print(f"[CONSOLIDATE] Split into {len(decision.split_facts)} facts: '{fact_text[:60]}...'")
 
@@ -888,3 +979,14 @@ def consolidate_memories():
 
     print(f"[CONSOLIDATE] Done. {report}")
     return {"status": "success", "report": report}
+
+
+@app.post("/memory/consolidate", status_code=202)
+def consolidate_memories():
+    """Enqueues a five-phase memory hygiene pass. Returns a task handle immediately.
+
+    Poll GET /memory/task/{task_id} for status and the full consolidation report.
+    """
+    task_id = _create_task()
+    _run_task_in_background(task_id, _consolidate_memories_sync)
+    return {"task_id": task_id, "status": "pending"}

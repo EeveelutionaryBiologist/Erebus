@@ -35,6 +35,17 @@ from librarian import (
 )
 
 
+def wait_for_task(client, task_id: str) -> dict:
+    """Poll GET /memory/task/{task_id} and return the task dict.
+
+    In tests, _run_task_in_background is patched to run synchronously (see conftest),
+    so the task is already completed before the originating HTTP response arrives.
+    """
+    resp = client.get(f"/memory/task/{task_id}")
+    assert resp.status_code == 200, f"task lookup failed: {resp.text}"
+    return resp.json()
+
+
 # ---------------------------------------------------------------------------
 # POST /memory/add
 # ---------------------------------------------------------------------------
@@ -49,10 +60,12 @@ class TestAddMemory:
             ),
         )
         resp = app_client.post("/memory/add", json={"text": "Alice owns a bakery."})
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["status"] == "success"
-        assert "1 standalone facts" in body["message"]
+        assert resp.status_code == 202
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        result = task["result"]
+        assert result["status"] == "success"
+        assert "1 standalone facts" in result["message"]
 
     def test_add_persists_raw_chunk(self, app_client, monkeypatch):
         monkeypatch.setattr(
@@ -92,10 +105,13 @@ class TestAddMemory:
         assert "Alice" in names
         assert "Bakery" in names
 
-    def test_add_librarian_failure_returns_500(self, app_client, monkeypatch):
+    def test_add_librarian_failure_reports_task_error(self, app_client, monkeypatch):
         monkeypatch.setattr("memory_server.process_memory_chunk", lambda text: None)
         resp = app_client.post("/memory/add", json={"text": "anything"})
-        assert resp.status_code == 500
+        assert resp.status_code == 202
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "failed"
+        assert "Librarian" in task["error"]
 
     def test_add_graph_flushed_once_for_multiple_triples(self, app_client, monkeypatch):
         """write_graph() must be called exactly once per /memory/add, not once per triple."""
@@ -281,8 +297,10 @@ class TestConsolidateMemories:
         monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
 
         resp = app_client.post("/memory/consolidate")
-        assert resp.status_code == 200
-        report = resp.json()["report"]
+        assert resp.status_code == 202
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        report = task["result"]["report"]
         assert "pruned" in report
         assert "merged" in report
         assert "split" in report
@@ -331,8 +349,10 @@ class TestConsolidateMemories:
         monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
 
         resp = app_client.post("/memory/consolidate")
-        assert resp.status_code == 200
-        assert resp.json()["report"]["superseded"] >= 1
+        assert resp.status_code == 202
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        assert task["result"]["report"]["superseded"] >= 1
 
         cursor = memory_server.sqlite_conn.cursor()
         cursor.execute("SELECT content, temporal_status FROM atomic_facts")
@@ -363,8 +383,10 @@ class TestConsolidateMemories:
         monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
 
         resp = app_client.post("/memory/consolidate")
-        assert resp.status_code == 200
-        flagged = resp.json()["report"]["flagged"]
+        assert resp.status_code == 202
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        flagged = task["result"]["report"]["flagged"]
         assert len(flagged) >= 1
         entry = flagged[0]
         assert entry["type"] == "contradiction"
@@ -395,7 +417,9 @@ class TestConsolidateMemories:
         monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
 
         resp = app_client.post("/memory/consolidate")
-        flagged = resp.json()["report"]["flagged"]
+        assert resp.status_code == 202
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        flagged = task["result"]["report"]["flagged"]
         assert len([f for f in flagged if f["subject"] == "Bob"]) == 1
 
     def test_consolidate_phase4_supersession_chunk_granularity(self, app_client, monkeypatch):
@@ -804,19 +828,23 @@ class TestLearnEndpoint:
             lambda text: MemoryProcessing(atomic_facts=["Alice is kind."], triples=[]),
         )
         resp = app_client.post("/memory/learn", json={"text": "Alice is kind. She is generous."})
-        assert resp.status_code == 200
-        body = resp.json()
+        assert resp.status_code == 202
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        result = task["result"]
         for key in ("status", "chunks_total", "chunks_succeeded", "facts_added", "triples_added", "errors"):
-            assert key in body, f"Missing key: {key}"
+            assert key in result, f"Missing key: {key}"
 
     def test_learn_empty_text_returns_zero_chunks(self, app_client):
         resp = app_client.post("/memory/learn", json={"text": ""})
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["status"] == "success"
-        assert body["chunks_total"] == 0
-        assert body["facts_added"] == 0
-        assert body["errors"] == []
+        assert resp.status_code == 202
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        result = task["result"]
+        assert result["status"] == "success"
+        assert result["chunks_total"] == 0
+        assert result["facts_added"] == 0
+        assert result["errors"] == []
 
     def test_learn_single_sentence_produces_one_chunk(self, app_client, monkeypatch):
         monkeypatch.setattr(
@@ -824,11 +852,13 @@ class TestLearnEndpoint:
             lambda text: MemoryProcessing(atomic_facts=["Alice is kind."], triples=[]),
         )
         resp = app_client.post("/memory/learn", json={"text": "Alice is kind."})
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["chunks_total"] == 1
-        assert body["chunks_succeeded"] == 1
-        assert body["facts_added"] == 1
+        assert resp.status_code == 202
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        result = task["result"]
+        assert result["chunks_total"] == 1
+        assert result["chunks_succeeded"] == 1
+        assert result["facts_added"] == 1
 
     def test_learn_aggregates_facts_across_chunks(self, app_client, monkeypatch):
         """10 sentences → 2 chunks of 5 → each chunk produces 1 fact → facts_added == 2."""
@@ -844,13 +874,15 @@ class TestLearnEndpoint:
         monkeypatch.setattr("memory_server.process_memory_chunk", stub)
         sentences = " ".join(f"Sentence {i} is here." for i in range(10))
         resp = app_client.post("/memory/learn", json={"text": sentences})
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["chunks_total"] == 2
-        assert body["chunks_succeeded"] == 2
-        assert body["facts_added"] == 2
-        assert body["triples_added"] == 2
-        assert body["status"] == "success"
+        assert resp.status_code == 202
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        result = task["result"]
+        assert result["chunks_total"] == 2
+        assert result["chunks_succeeded"] == 2
+        assert result["facts_added"] == 2
+        assert result["triples_added"] == 2
+        assert result["status"] == "success"
 
     def test_learn_partial_failure_returns_partial_status(self, app_client, monkeypatch):
         """If a chunk's Librarian call fails, the endpoint reports partial success."""
@@ -865,13 +897,15 @@ class TestLearnEndpoint:
         monkeypatch.setattr("memory_server.process_memory_chunk", stub)
         sentences = " ".join(f"Sentence {i} is here." for i in range(10))
         resp = app_client.post("/memory/learn", json={"text": sentences})
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["status"] == "partial"
-        assert body["chunks_total"] == 2
-        assert body["chunks_succeeded"] == 1
-        assert len(body["errors"]) == 1
-        assert body["errors"][0]["chunk_index"] == 1
+        assert resp.status_code == 202
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        result = task["result"]
+        assert result["status"] == "partial"
+        assert result["chunks_total"] == 2
+        assert result["chunks_succeeded"] == 1
+        assert len(result["errors"]) == 1
+        assert result["errors"][0]["chunk_index"] == 1
 
     def test_learn_no_overlap_between_chunks(self, app_client, monkeypatch):
         """Sentences are not duplicated across chunks — each sentence is ingested exactly once."""
@@ -905,7 +939,8 @@ class TestLearnEndpoint:
 
         sentences = " ".join(f"S{i}." for i in range(10))
         resp = app_client.post("/memory/learn", json={"text": sentences})
-        assert resp.status_code == 200
+        assert resp.status_code == 202
+        wait_for_task(app_client, resp.json()["task_id"])
 
         # chunk 0: no prefix
         assert not received[0].startswith("[CONTEXT:")
@@ -927,7 +962,8 @@ class TestLearnEndpoint:
         )
 
         resp = app_client.post("/memory/learn", json={"text": "Just one sentence."})
-        assert resp.status_code == 200
+        assert resp.status_code == 202
+        wait_for_task(app_client, resp.json()["task_id"])
         assert hint_calls == []
 
     def test_learn_proceeds_without_prefix_when_hint_returns_none(self, app_client, monkeypatch):
