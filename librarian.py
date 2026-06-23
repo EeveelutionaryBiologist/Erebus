@@ -98,8 +98,22 @@ class ContextHint(BaseModel):
 
 # --- INFERENCE FUNCTIONS ---
 
-def process_memory_chunk(text: str) -> MemoryProcessing | None:
-    """Extracts atomic facts (for ChromaDB) AND triples (for the Graph) simultaneously."""
+def process_memory_chunk(text: str, known_entities: list[str] | None = None) -> MemoryProcessing | None:
+    """Extracts atomic facts (for ChromaDB) AND triples (for the Graph) simultaneously.
+
+    known_entities: canonical entity names already in the graph that appear in this chunk.
+    When provided, the prompt instructs the model to prefer these exact names as triple
+    subjects/objects rather than inventing compound role-description strings.
+    """
+    entity_hint = ""
+    if known_entities:
+        names = ", ".join(f'"{n}"' for n in known_entities)
+        entity_hint = (
+            f" The following entity names already exist in the knowledge graph: [{names}]. "
+            "When one of these entities would naturally appear as a subject or object in a triple, "
+            "use its exact name from this list — do not paraphrase or embed it in a longer string."
+        )
+
     system_prompt = (
         "You are an advanced data extraction AI. You have two tasks:\n"
         "1. Extract 'atomic_facts': Break the text into independent, single-fact sentences. "
@@ -118,7 +132,13 @@ def process_memory_chunk(text: str) -> MemoryProcessing | None:
         "temporal context — never emit it as a fact itself.\n"
         "2. Extract 'triples': Subject-predicate-object relationships from the text. "
         "Use past-tense predicates (WAS, HAD) for historical facts and present-tense (IS, HAS) for current ones. "
-        "For each triple, set supporting_fact_indices to the zero-based index (or indices) of the atomic_facts "
+        "IMPORTANT: Triple objects must be simple, atomic entity names — never compound role-description strings. "
+        "If a sentence says someone holds a role AT or FOR another entity, encode the role in the predicate "
+        "and use the other entity as the object. "
+        "BAD: (James, IS, Advisor To Cellbridge Therapeutics). "
+        "GOOD: (James, IS_ADVISOR_TO, Cellbridge Therapeutics)."
+        + entity_hint +
+        " For each triple, set supporting_fact_indices to the zero-based index (or indices) of the atomic_facts "
         "entry that directly states the information in that triple. "
         "Example: if atomic_facts[0] is 'Alice was a nurse.' and the triple is (Alice, WAS, Nurse), "
         "set supporting_fact_indices to [0]. If two facts jointly support a triple, list both indices."

@@ -463,8 +463,21 @@ def _add_memory_sync(memory: MemoryInput, conn: sqlite3.Connection) -> dict:
     now = datetime.now().isoformat()
     cursor = conn.cursor()
 
-    # 1. Ask Librarian to process the chunk
-    processed_data = process_memory_chunk(memory.text)
+    # 1. Ask Librarian to process the chunk.
+    # Inject entity names that literally appear in the chunk text so the model can
+    # prefer existing entities as triple objects rather than creating compound strings
+    # like "Advisor To Cellbridge Therapeutics" when "Cellbridge Therapeutics" exists.
+    chunk_lower = memory.text.lower()
+    cursor.execute("SELECT canonical_name FROM entities")
+    known_entities = [
+        row[0] for row in cursor.fetchall()
+        if row[0].lower() in chunk_lower
+    ]
+    processed_data = (
+        process_memory_chunk(memory.text, known_entities=known_entities)
+        if known_entities
+        else process_memory_chunk(memory.text)
+    )
     if not processed_data:
         raise HTTPException(status_code=500, detail="Librarian failed to process memory.")
 
