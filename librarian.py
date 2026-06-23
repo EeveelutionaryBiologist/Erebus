@@ -16,6 +16,10 @@ class KnowledgeTriple(BaseModel):
     subject: str = Field(description="The main entity (e.g., 'Hailey')")
     predicate: str = Field(description="The relationship (e.g., 'HAS', 'IS', 'MOTHER_OF')")
     object: str = Field(description="The target entity (e.g., 'Mochi')")
+    supporting_fact_indices: list[int] = Field(
+        default_factory=list,
+        description="Zero-based indices into atomic_facts for the fact(s) that directly state this triple's information."
+    )
 
 class AtomicFact(BaseModel):
     text: str = Field(description="A single, standalone sentence with all pronouns resolved.")
@@ -64,6 +68,13 @@ class SupersessionDecision(BaseModel):
         description="Brief explanation of the relationship between the two facts."
     )
 
+class ConcurrencyDecision(BaseModel):
+    outcome: Literal["concurrent", "not_concurrent"]
+    explanation: str = Field(
+        default="",
+        description="Brief explanation of why the two facts are or are not temporally concurrent."
+    )
+
 class GroupAssignment(BaseModel):
     matching_groups: list[str] = Field(
         default_factory=list,
@@ -106,7 +117,11 @@ def process_memory_chunk(text: str) -> MemoryProcessing | None:
         "IMPORTANT: If the text begins with a '[CONTEXT: ...]' line, use it only to resolve pronouns and infer "
         "temporal context — never emit it as a fact itself.\n"
         "2. Extract 'triples': Subject-predicate-object relationships from the text. "
-        "Use past-tense predicates (WAS, HAD) for historical facts and present-tense (IS, HAS) for current ones."
+        "Use past-tense predicates (WAS, HAD) for historical facts and present-tense (IS, HAS) for current ones. "
+        "For each triple, set supporting_fact_indices to the zero-based index (or indices) of the atomic_facts "
+        "entry that directly states the information in that triple. "
+        "Example: if atomic_facts[0] is 'Alice was a nurse.' and the triple is (Alice, WAS, Nurse), "
+        "set supporting_fact_indices to [0]. If two facts jointly support a triple, list both indices."
     )
 
     print(f"[LIBRARIAN] Processing chunk for DBs: '{text[:50]}...'")
@@ -218,6 +233,42 @@ def librarian_check_supersession(fact_a: str, fact_b: str) -> SupersessionDecisi
         return SupersessionDecision(**json.loads(output_str))
     except Exception as e:
         print(f"[LIBRARIAN ERROR] Supersession check failed: {e}")
+        return None
+
+
+def librarian_check_concurrency(
+    fact_a: str, fact_b: str, period_a: str, period_b: str
+) -> ConcurrencyDecision | None:
+    """Determines whether two historical facts were true during an overlapping time window.
+
+    Both facts must already have a non-null valid_period; the periods are passed explicitly
+    so the model can use them without re-reading the fact text.
+    """
+    system_prompt = (
+        "You are a temporal fact analyzer. Given two historical facts and their time periods, "
+        "decide whether the facts were true at the same time (overlapping periods).\n"
+        "- 'concurrent': The facts were both true during an overlapping period "
+        "(e.g., 'college years' and '2015-2019' for the same person likely overlap).\n"
+        "- 'not_concurrent': The periods are clearly distinct and non-overlapping.\n\n"
+        "When in doubt, or when the periods are vague enough that you cannot rule out overlap, "
+        "prefer 'not_concurrent' to avoid false positives."
+    )
+    user_content = (
+        f'Fact A: "{fact_a}"\nTime period A: "{period_a}"\n\n'
+        f'Fact B: "{fact_b}"\nTime period B: "{period_b}"'
+    )
+    try:
+        output_str = get_llm_client().chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            schema=ConcurrencyDecision.model_json_schema(),
+            temperature=0.1,
+        )
+        return ConcurrencyDecision(**json.loads(output_str))
+    except Exception as e:
+        print(f"[LIBRARIAN ERROR] Concurrency check failed: {e}")
         return None
 
 

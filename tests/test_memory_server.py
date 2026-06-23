@@ -25,6 +25,7 @@ import pytest
 from librarian import (
     AtomicFact,
     ContextHint,
+    ConcurrencyDecision,
     EntityExtraction,
     Entity,
     GroupAssignment,
@@ -423,17 +424,29 @@ class TestConsolidateMemories:
         flagged = task["result"]["report"]["flagged"]
         assert len([f for f in flagged if f["subject"] == "Bob"]) == 1
 
-    def test_consolidate_phase4_supersession_chunk_granularity(self, app_client, monkeypatch):
+    def test_consolidate_phase4_supersession_per_triple_linkage(self, app_client, monkeypatch):
         """
-        KNOWN LIMITATION (pinned): supersession marks all facts in a chunk as historical,
-        not just the fact that backs the WAS edge. Fact-to-edge linkage is chunk-level
-        because the Librarian returns atomic_facts and triples as independent lists.
+        Phase 4 supersession only marks the fact that backs the WAS edge as historical,
+        not unrelated facts from the same chunk. supporting_fact_indices on KnowledgeTriple
+        pins each edge to the specific atomic fact(s) that produced it.
 
-        Here "Hailey owns a dog." incorrectly becomes historical because it shares a
-        batch with the WAS-Fencer edge. Per-triple fact linking would fix this but
-        requires a Librarian schema change.
+        "Hailey owns a dog." must stay 'current' because only atomic_facts[0]
+        ("Hailey was a fencer.", index 0) backs the WAS-Fencer edge.
+
+        get_embedding is stubbed to assign a distinct unit vector to each unique text so
+        that Phase 2 does not spuriously dedup semantically different facts.
         """
         import memory_server
+
+        # Each unique text gets its own dimension → cosine sim between different facts = 0.
+        seen_texts: dict[str, int] = {}
+        def unique_embedding(text):
+            if text not in seen_texts:
+                seen_texts[text] = len(seen_texts)
+            vec = [0.0] * 768
+            vec[seen_texts[text] % 768] = 1.0
+            return vec
+        monkeypatch.setattr("memory_server.get_embedding", unique_embedding)
 
         call_count = [0]
 
@@ -442,17 +455,20 @@ class TestConsolidateMemories:
             if call_count[0] == 1:
                 return MemoryProcessing(
                     atomic_facts=[
-                        AtomicFact(text="Hailey was a fencer."),
-                        AtomicFact(text="Hailey owns a dog."),
+                        AtomicFact(text="Hailey was a fencer."),   # index 0
+                        AtomicFact(text="Hailey owns a dog."),      # index 1
                     ],
                     triples=[
-                        KnowledgeTriple(subject="Hailey", predicate="WAS", object="Fencer"),
-                        KnowledgeTriple(subject="Hailey", predicate="OWNS", object="Dog"),
+                        KnowledgeTriple(subject="Hailey", predicate="WAS", object="Fencer",
+                                        supporting_fact_indices=[0]),
+                        KnowledgeTriple(subject="Hailey", predicate="OWNS", object="Dog",
+                                        supporting_fact_indices=[1]),
                     ],
                 )
             return MemoryProcessing(
                 atomic_facts=[AtomicFact(text="Hailey is a fencer.")],
-                triples=[KnowledgeTriple(subject="Hailey", predicate="IS", object="Fencer")],
+                triples=[KnowledgeTriple(subject="Hailey", predicate="IS", object="Fencer",
+                                         supporting_fact_indices=[0])],
             )
 
         monkeypatch.setattr("memory_server.process_memory_chunk", two_fact_chunk)
@@ -468,9 +484,10 @@ class TestConsolidateMemories:
         cursor.execute("SELECT content, temporal_status FROM atomic_facts")
         rows = dict(cursor.fetchall())
         assert rows.get("Hailey is a fencer.") == "current"
-        # Chunk-granularity limitation: "Hailey owns a dog." shares batch fact_ids
-        # with the WAS-Fencer edge and is incorrectly marked historical.
-        assert rows.get("Hailey owns a dog.") == "historical"
+        assert rows.get("Hailey was a fencer.") == "historical"
+        # Per-triple linkage: "Hailey owns a dog." is backed only by index 1 (OWNS edge),
+        # which has no IS counterpart — so it must remain 'current'.
+        assert rows.get("Hailey owns a dog.") == "current"
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +498,7 @@ class TestConsolidatePhase4b:
     def _stub_consolidation_helpers(self, monkeypatch):
         monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
         monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+        monkeypatch.setattr("memory_server.librarian_check_concurrency", lambda a, b, pa, pb: None)
 
     def test_phase4b_a_supersedes_b_marks_neighbor_historical(self, app_client, monkeypatch):
         """Keyword fact (A) superseding neighbor (B) marks B historical."""
@@ -1532,6 +1550,7 @@ class TestTemporalGraph:
     def _stub_consolidation_helpers(self, monkeypatch):
         monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
         monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+        monkeypatch.setattr("memory_server.librarian_check_concurrency", lambda a, b, pa, pb: None)
 
     def test_phase4_structural_creates_preceded_by_edge(self, app_client, monkeypatch):
         """Phase 4 structural supersession adds current -[PRECEDED_BY]-> past in temporal_graph."""
@@ -1705,7 +1724,9 @@ class TestTemporalGraph:
             (e for e in tc if e["current_fact"] == "Alice is a doctor."), None
         )
         assert doctor_entry is not None, "temporal_context should include Alice is a doctor."
-        assert "Alice was a nurse." in doctor_entry["preceded_by"]
+        # preceded_by is now list[{fact, concurrent_with}]
+        pred_facts = [p["fact"] for p in doctor_entry["preceded_by"]]
+        assert "Alice was a nurse." in pred_facts
 
     def test_search_results_include_fact_id(self, app_client, monkeypatch):
         """POST /memory/search results now include an 'id' field for each fact."""
@@ -1789,3 +1810,345 @@ class TestTemporalGraph:
         tc = body["temporal_context"]
         assert tc == [], \
             "temporal_context should be empty when all predecessors are dead (not in SQLite)"
+
+    def test_phase2_high_sim_dedup_transfers_temporal_predecessors(self, app_client, monkeypatch):
+        """Phase 2 high-sim dedup (sim=1.0) keeps the temporal chain on the surviving fact."""
+        import uuid
+        import memory_server
+        from datetime import datetime
+
+        now = datetime.now().isoformat()
+        cursor = memory_server.sqlite_conn.cursor()
+
+        # Historical predecessor.
+        past_id = str(uuid.uuid4())
+        cursor.execute(
+            "INSERT INTO atomic_facts (id, content, temporal_status, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Alice was a nurse.', 'historical', 0, ?, ?)",
+            (past_id, now, now),
+        )
+        # Current fact A — has a temporal chain.
+        a_id = str(uuid.uuid4())
+        cursor.execute(
+            "INSERT INTO atomic_facts (id, content, temporal_status, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Alice is a doctor.', 'current', 0, ?, ?)",
+            (a_id, now, now),
+        )
+        # Current fact B — identical duplicate (same text, same stub embedding → sim=1.0).
+        b_id = str(uuid.uuid4())
+        cursor.execute(
+            "INSERT INTO atomic_facts (id, content, temporal_status, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Alice is a doctor.', 'current', 0, ?, ?)",
+            (b_id, now, now),
+        )
+        memory_server.sqlite_conn.commit()
+
+        memory_server.collection.add(
+            embeddings=[[0.1] * 768, [0.1] * 768],
+            documents=["Alice is a doctor.", "Alice is a doctor."],
+            ids=[a_id, b_id],
+        )
+        # Wire temporal chain on a_id only.
+        memory_server.temporal_graph.add_relationship(
+            a_id, "PRECEDED_BY", past_id,
+            subject_name="Alice is a doctor.",
+            object_name="Alice was a nurse.",
+            fact_ids=[past_id], persist=False,
+        )
+
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+        monkeypatch.setattr("memory_server.librarian_check_supersession", lambda a, b: None)
+        app_client.post("/memory/consolidate")
+
+        # One "Alice is a doctor." survives.
+        cursor.execute("SELECT id FROM atomic_facts WHERE content = 'Alice is a doctor.'")
+        surviving_id = cursor.fetchone()[0]
+
+        tg = memory_server.temporal_graph
+        assert tg.G.has_edge(surviving_id, past_id), \
+            "surviving fact must retain/inherit the PRECEDED_BY edge after high-sim dedup"
+        assert set(tg.G.nodes()) == {surviving_id, past_id}, \
+            "temporal_graph must not contain stale nodes from the dropped duplicate"
+
+    def test_phase2_librarian_merge_transfers_temporal_predecessors(self, app_client, monkeypatch):
+        """Phase 2 Librarian-decided merge propagates the temporal chain to the merged fact."""
+        import uuid
+        import memory_server
+        from datetime import datetime
+
+        now = datetime.now().isoformat()
+        cursor = memory_server.sqlite_conn.cursor()
+
+        # Historical predecessor.
+        past_id = str(uuid.uuid4())
+        cursor.execute(
+            "INSERT INTO atomic_facts (id, content, temporal_status, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Alice was a nurse.', 'historical', 0, ?, ?)",
+            (past_id, now, now),
+        )
+        # Current fact A — has a temporal chain.
+        a_id = str(uuid.uuid4())
+        cursor.execute(
+            "INSERT INTO atomic_facts (id, content, temporal_status, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Alice is a doctor.', 'current', 0, ?, ?)",
+            (a_id, now, now),
+        )
+        # Current fact B — similar but distinct text.
+        b_id = str(uuid.uuid4())
+        cursor.execute(
+            "INSERT INTO atomic_facts (id, content, temporal_status, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Alice works as a physician.', 'current', 0, ?, ?)",
+            (b_id, now, now),
+        )
+        memory_server.sqlite_conn.commit()
+
+        # sim(vec_a, vec_b) ≈ 0.95: above DEDUP_SIMILARITY_THRESHOLD (0.90) but below
+        # HIGH_SIM_DEDUP_THRESHOLD (0.99), so the Librarian merge path is exercised.
+        vec_a = [1.0] + [0.0] * 767
+        vec_b = [0.95, 0.31225] + [0.0] * 766
+        memory_server.collection.add(
+            embeddings=[vec_a, vec_b],
+            documents=["Alice is a doctor.", "Alice works as a physician."],
+            ids=[a_id, b_id],
+        )
+        # Wire temporal chain on a_id only.
+        memory_server.temporal_graph.add_relationship(
+            a_id, "PRECEDED_BY", past_id,
+            subject_name="Alice is a doctor.",
+            object_name="Alice was a nurse.",
+            fact_ids=[past_id], persist=False,
+        )
+
+        monkeypatch.setattr(
+            "memory_server.librarian_should_merge",
+            lambda a, b: MergeDecision(should_merge=True, merged_fact="Alice is a doctor/physician."),
+        )
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+        monkeypatch.setattr("memory_server.librarian_check_supersession", lambda a, b: None)
+        app_client.post("/memory/consolidate")
+
+        cursor.execute("SELECT id FROM atomic_facts WHERE content = 'Alice is a doctor/physician.'")
+        merged_row = cursor.fetchone()
+        assert merged_row is not None, "merged fact must exist in SQLite"
+        merged_id = merged_row[0]
+
+        tg = memory_server.temporal_graph
+        assert tg.G.has_node(merged_id), "merged fact must be a node in temporal_graph"
+        assert tg.G.has_edge(merged_id, past_id), \
+            "merged fact must inherit the PRECEDED_BY edge from the original current fact"
+        assert not tg.G.has_node(a_id), "original fact a must not remain in temporal_graph"
+        assert not tg.G.has_node(b_id), "original fact b must not remain in temporal_graph"
+
+    def test_phase4c_creates_concurrent_with_edges(self, app_client, monkeypatch):
+        """Phase 4c creates bidirectional CONCURRENT_WITH edges for confirmed concurrent facts."""
+        import uuid
+        import memory_server
+        from datetime import datetime
+
+        now = datetime.now().isoformat()
+        cursor = memory_server.sqlite_conn.cursor()
+
+        # Two historical facts that both have a valid_period.
+        id_a = str(uuid.uuid4())
+        id_b = str(uuid.uuid4())
+        cursor.execute(
+            "INSERT INTO atomic_facts "
+            "(id, content, temporal_status, valid_period, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Alice was a nurse.', 'historical', 'college years', 0, ?, ?)",
+            (id_a, now, now),
+        )
+        cursor.execute(
+            "INSERT INTO atomic_facts "
+            "(id, content, temporal_status, valid_period, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Alice lived in Seattle.', 'historical', 'college years', 0, ?, ?)",
+            (id_b, now, now),
+        )
+        memory_server.sqlite_conn.commit()
+
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+        monkeypatch.setattr("memory_server.librarian_check_supersession", lambda a, b: None)
+        monkeypatch.setattr(
+            "memory_server.librarian_check_concurrency",
+            lambda a, b, pa, pb: ConcurrencyDecision(outcome="concurrent"),
+        )
+
+        app_client.post("/memory/consolidate")
+
+        tg = memory_server.temporal_graph
+        assert tg.G.has_node(id_a) and tg.G.has_node(id_b), \
+            "both historical facts must be nodes in the temporal graph after Phase 4c"
+
+        # Bidirectional edges.
+        edges_a_to_b = [
+            d for _, _, d in tg.G.out_edges(id_a, data=True)
+            if d.get("relation") == "CONCURRENT_WITH"
+        ]
+        edges_b_to_a = [
+            d for _, _, d in tg.G.out_edges(id_b, data=True)
+            if d.get("relation") == "CONCURRENT_WITH"
+        ]
+        assert len(edges_a_to_b) >= 1, "id_a must have a CONCURRENT_WITH out-edge to id_b"
+        assert len(edges_b_to_a) >= 1, "id_b must have a CONCURRENT_WITH out-edge to id_a"
+
+    def test_search_includes_concurrent_with_in_temporal_context(self, app_client, monkeypatch):
+        """After Phase 4c, /memory/search populates concurrent_with on each preceded_by entry."""
+        import uuid
+        import memory_server
+        from datetime import datetime
+
+        now = datetime.now().isoformat()
+        cursor = memory_server.sqlite_conn.cursor()
+
+        # Current fact with a predecessor.
+        current_id = str(uuid.uuid4())
+        past_id = str(uuid.uuid4())
+        concurrent_id = str(uuid.uuid4())
+
+        cursor.execute(
+            "INSERT INTO atomic_facts (id, content, temporal_status, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Alice is a doctor.', 'current', 1, ?, ?)",
+            (current_id, now, now),
+        )
+        cursor.execute(
+            "INSERT INTO atomic_facts "
+            "(id, content, temporal_status, valid_period, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Alice was a nurse.', 'historical', 'college years', 0, ?, ?)",
+            (past_id, now, now),
+        )
+        cursor.execute(
+            "INSERT INTO atomic_facts "
+            "(id, content, temporal_status, valid_period, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Alice lived in Seattle.', 'historical', 'college years', 0, ?, ?)",
+            (concurrent_id, now, now),
+        )
+        memory_server.sqlite_conn.commit()
+
+        memory_server.collection.add(
+            embeddings=[[0.1] * 768],
+            documents=["Alice is a doctor."],
+            ids=[current_id],
+        )
+
+        tg = memory_server.temporal_graph
+        tg.add_relationship(
+            current_id, "PRECEDED_BY", past_id,
+            subject_name="Alice is a doctor.",
+            object_name="Alice was a nurse.",
+            fact_ids=[past_id], persist=False,
+        )
+        # Bidirectional CONCURRENT_WITH between the two historical facts.
+        tg.add_relationship(
+            past_id, "CONCURRENT_WITH", concurrent_id,
+            subject_name="Alice was a nurse.",
+            object_name="Alice lived in Seattle.",
+            fact_ids=[concurrent_id], persist=False,
+        )
+        tg.add_relationship(
+            concurrent_id, "CONCURRENT_WITH", past_id,
+            subject_name="Alice lived in Seattle.",
+            object_name="Alice was a nurse.",
+            fact_ids=[past_id], persist=False,
+        )
+
+        monkeypatch.setattr("memory_server.extract_entities_from_text", lambda q: None)
+        resp = app_client.post("/memory/search", json={"query": "Alice doctor", "top_k": 1})
+        assert resp.status_code == 200
+        body = resp.json()
+        tc = body["temporal_context"]
+        doctor_entry = next(
+            (e for e in tc if e["current_fact"] == "Alice is a doctor."), None
+        )
+        assert doctor_entry is not None
+        pb = doctor_entry["preceded_by"]
+        nurse_entry = next((p for p in pb if p["fact"] == "Alice was a nurse."), None)
+        assert nurse_entry is not None, "preceded_by must include Alice was a nurse."
+        assert "Alice lived in Seattle." in nurse_entry["concurrent_with"], \
+            "concurrent_with must list Alice lived in Seattle. alongside the nurse predecessor"
+
+    def test_phase2_transfers_concurrent_with_edges(self, app_client, monkeypatch):
+        """Phase 2 high-sim dedup transfers CONCURRENT_WITH edges to the surviving fact."""
+        import uuid
+        import memory_server
+        from datetime import datetime
+
+        now = datetime.now().isoformat()
+        cursor = memory_server.sqlite_conn.cursor()
+
+        # Historical fact that is concurrent with the current-state predecessor.
+        concurrent_id = str(uuid.uuid4())
+        cursor.execute(
+            "INSERT INTO atomic_facts "
+            "(id, content, temporal_status, valid_period, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Alice lived in Seattle.', 'historical', 'college years', 0, ?, ?)",
+            (concurrent_id, now, now),
+        )
+        # Past-state predecessor for the current facts.
+        past_id = str(uuid.uuid4())
+        cursor.execute(
+            "INSERT INTO atomic_facts "
+            "(id, content, temporal_status, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Alice was a nurse.', 'historical', 0, ?, ?)",
+            (past_id, now, now),
+        )
+        # Two identical current facts (sim=1.0 → high-sim dedup path).
+        a_id = str(uuid.uuid4())
+        b_id = str(uuid.uuid4())
+        for fid in (a_id, b_id):
+            cursor.execute(
+                "INSERT INTO atomic_facts (id, content, temporal_status, hit_count, created_at, last_accessed) "
+                "VALUES (?, 'Alice is a doctor.', 'current', 0, ?, ?)",
+                (fid, now, now),
+            )
+        memory_server.sqlite_conn.commit()
+
+        memory_server.collection.add(
+            embeddings=[[0.1] * 768, [0.1] * 768],
+            documents=["Alice is a doctor.", "Alice is a doctor."],
+            ids=[a_id, b_id],
+        )
+
+        tg = memory_server.temporal_graph
+        # a_id has PRECEDED_BY → past_id, which itself has CONCURRENT_WITH ↔ concurrent_id.
+        tg.add_relationship(
+            a_id, "PRECEDED_BY", past_id,
+            subject_name="Alice is a doctor.",
+            object_name="Alice was a nurse.",
+            fact_ids=[past_id], persist=False,
+        )
+        tg.add_relationship(
+            past_id, "CONCURRENT_WITH", concurrent_id,
+            subject_name="Alice was a nurse.",
+            object_name="Alice lived in Seattle.",
+            fact_ids=[concurrent_id], persist=False,
+        )
+        tg.add_relationship(
+            concurrent_id, "CONCURRENT_WITH", past_id,
+            subject_name="Alice lived in Seattle.",
+            object_name="Alice was a nurse.",
+            fact_ids=[past_id], persist=False,
+        )
+
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+        monkeypatch.setattr("memory_server.librarian_check_supersession", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_check_concurrency", lambda a, b, pa, pb: None)
+        app_client.post("/memory/consolidate")
+
+        cursor.execute("SELECT id FROM atomic_facts WHERE content = 'Alice is a doctor.'")
+        surviving_id = cursor.fetchone()[0]
+
+        # Surviving fact must inherit the PRECEDED_BY → past chain.
+        assert tg.G.has_edge(surviving_id, past_id), \
+            "surviving fact must have PRECEDED_BY → past_id"
+        # The CONCURRENT_WITH edges on past_id are untouched (they are on the historical node,
+        # not on the dropped duplicate, so no transfer was needed — this tests they persist).
+        assert tg.G.has_node(past_id), "past_id node must still exist"
+        assert tg.G.has_node(concurrent_id), "concurrent_id node must still exist"
+        cw_edges = [
+            d for _, _, d in tg.G.out_edges(past_id, data=True)
+            if d.get("relation") == "CONCURRENT_WITH"
+        ]
+        assert len(cw_edges) >= 1, \
+            "past_id must still have its CONCURRENT_WITH edge to concurrent_id"

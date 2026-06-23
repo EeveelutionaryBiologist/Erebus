@@ -25,6 +25,7 @@ from librarian import (
     librarian_should_merge,
     librarian_split_compound,
     librarian_check_supersession,
+    librarian_check_concurrency,
     librarian_assign_groups,
     ContextHint,
 )
@@ -358,6 +359,10 @@ SUPERSESSION_KEYWORDS: frozenset[str] = frozenset([
     "no longer", "used to", "formerly", "previously", "once was", "not anymore",
 ])
 
+# Maximum historical-fact pairs examined per consolidation pass in Phase 4c.
+# Prevents O(n²) LLM calls when many historical facts share a valid_period.
+CONCURRENT_WITH_MAX_PAIRS = 50
+
 # ==========================================
 # 5. ASYNC TASK INFRASTRUCTURE
 # ==========================================
@@ -487,7 +492,9 @@ def _add_memory_sync(memory: MemoryInput, conn: sqlite3.Connection) -> dict:
         )
     conn.commit()
 
-    # 4. Save Triples to Knowledge Graph, linked to this batch's fact IDs.
+    # 4. Save Triples to Knowledge Graph, linked to the specific facts that back each triple.
+    # supporting_fact_indices maps each triple to its atomic_facts positions (per-triple linkage).
+    # Fallback to all chunk facts when the Librarian omits indices (e.g. old prompts, test stubs).
     # persist=False defers the disk write; we flush once after the loop.
     entity_ids_in_chunk: dict[str, str] = {}  # entity_id → canonical_name
     for triple in processed_data.triples:
@@ -506,10 +513,20 @@ def _add_memory_sync(memory: MemoryInput, conn: sqlite3.Connection) -> dict:
             "INSERT OR IGNORE INTO entity_chunks (entity_id, chunk_id) VALUES (?, ?)",
             (object_id, raw_id),
         )
+        if triple.supporting_fact_indices:
+            fact_ids_for_triple = [
+                fact_ids_batch[i]
+                for i in triple.supporting_fact_indices
+                if 0 <= i < len(fact_ids_batch)
+            ]
+            if not fact_ids_for_triple:
+                fact_ids_for_triple = fact_ids_batch  # all indices out of range
+        else:
+            fact_ids_for_triple = fact_ids_batch  # no indices provided
         knowledge_graph.add_relationship(
             subject_id, pred, object_id,
             subject_name=subj, object_name=obj,
-            fact_ids=fact_ids_batch,
+            fact_ids=fact_ids_for_triple,
             persist=False,
         )
         print(f"  -> Graph Mapped: {subj} [{pred}] {obj}")
@@ -685,24 +702,49 @@ def search_memory(search: SearchQuery):
     # (i.e., has outgoing PRECEDED_BY edges), surface its historical predecessors.
     # Predecessor texts are fetched live from SQLite; dead endpoints (fact deleted by a
     # later consolidation phase) are silently skipped.
+    #
+    # preceded_by is a list[dict] with shape {fact, concurrent_with} so callers can see
+    # what else was happening during each historical period.
     temporal_context: list[dict] = []
     for result in final_results:
         fact_id = result["id"]
         if not temporal_graph.G.has_node(fact_id):
             continue
-        ancestor_ids = nx.descendants(temporal_graph.G, fact_id)
-        if not ancestor_ids:
+        # Type-filtered predecessor traversal: only follow PRECEDED_BY edges.
+        # nx.descendants() would also traverse CONCURRENT_WITH edges, which is wrong.
+        predecessor_ids: set[str] = set()
+        queue = [fact_id]
+        while queue:
+            node = queue.pop()
+            for _, succ, edge_data in temporal_graph.G.out_edges(node, data=True):
+                if edge_data.get("relation") == "PRECEDED_BY" and succ not in predecessor_ids:
+                    predecessor_ids.add(succ)
+                    queue.append(succ)
+        if not predecessor_ids:
             continue
-        ancestor_texts: list[str] = []
-        for anc_id in ancestor_ids:
-            cursor.execute("SELECT content FROM atomic_facts WHERE id = ?", (anc_id,))
-            anc_row = cursor.fetchone()
-            if anc_row:
-                ancestor_texts.append(anc_row[0])
-        if ancestor_texts:
+        preceded_by_entries: list[dict] = []
+        for pred_id in predecessor_ids:
+            cursor.execute("SELECT content FROM atomic_facts WHERE id = ?", (pred_id,))
+            pred_row = cursor.fetchone()
+            if not pred_row:
+                continue  # silently skip deleted predecessors
+            concurrent_texts: list[str] = []
+            for _, conc_id, conc_data in temporal_graph.G.out_edges(pred_id, data=True):
+                if conc_data.get("relation") == "CONCURRENT_WITH":
+                    cursor.execute(
+                        "SELECT content FROM atomic_facts WHERE id = ?", (conc_id,)
+                    )
+                    conc_row = cursor.fetchone()
+                    if conc_row:
+                        concurrent_texts.append(conc_row[0])
+            preceded_by_entries.append({
+                "fact": pred_row[0],
+                "concurrent_with": concurrent_texts,
+            })
+        if preceded_by_entries:
             temporal_context.append({
                 "current_fact": result["text"],
-                "preceded_by": ancestor_texts,
+                "preceded_by": preceded_by_entries,
             })
 
     return {
@@ -856,29 +898,49 @@ def clear_all_memories():
     return {"status": "success", "message": "All databases and graphs wiped clean."}
 
 
-def _transfer_temporal_predecessors(src_id: str, dst_id: str, dst_name: str) -> None:
-    """Copy PRECEDED_BY outgoing edges from src_id to dst_id in the temporal graph.
+def _node_name(node_id: str) -> str:
+    """Return the display name stored on a temporal graph node, falling back to the ID."""
+    if temporal_graph.G.has_node(node_id):
+        return temporal_graph.G.nodes[node_id].get("name", node_id)
+    return node_id
 
-    Called before a Phase 2 merge removes src_id so that the surviving/merged fact
-    inherits the supersession chain rather than leaving src_id as a dead node.
+
+def _transfer_temporal_predecessors(src_id: str, dst_id: str, dst_name: str) -> None:
+    """Copy all temporal edges from src_id to dst_id before src_id is removed.
+
+    Handles both PRECEDED_BY (directional supersession chain) and CONCURRENT_WITH
+    (bidirectional co-occurrence). Called before Phase 2 merges drop or replace a fact
+    so the survivor inherits the full temporal context.
     """
     if not temporal_graph.G.has_node(src_id):
         return
-    for _, pred_id, data in list(temporal_graph.G.out_edges(src_id, data=True)):
-        if data.get("relation") != "PRECEDED_BY":
-            continue
-        pred_name = (
-            temporal_graph.G.nodes[pred_id].get("name", pred_id)
-            if temporal_graph.G.has_node(pred_id)
-            else pred_id
-        )
-        temporal_graph.add_relationship(
-            dst_id, "PRECEDED_BY", pred_id,
-            subject_name=dst_name,
-            object_name=pred_name,
-            fact_ids=[pred_id],
-            persist=False,
-        )
+    for _, neighbour_id, data in list(temporal_graph.G.out_edges(src_id, data=True)):
+        relation = data.get("relation")
+        if relation == "PRECEDED_BY":
+            temporal_graph.add_relationship(
+                dst_id, "PRECEDED_BY", neighbour_id,
+                subject_name=dst_name,
+                object_name=_node_name(neighbour_id),
+                fact_ids=[neighbour_id],
+                persist=False,
+            )
+        elif relation == "CONCURRENT_WITH":
+            # Re-add both directions of the symmetric pair.
+            neighbour_name = _node_name(neighbour_id)
+            temporal_graph.add_relationship(
+                dst_id, "CONCURRENT_WITH", neighbour_id,
+                subject_name=dst_name,
+                object_name=neighbour_name,
+                fact_ids=[neighbour_id],
+                persist=False,
+            )
+            temporal_graph.add_relationship(
+                neighbour_id, "CONCURRENT_WITH", dst_id,
+                subject_name=neighbour_name,
+                object_name=dst_name,
+                fact_ids=[dst_id],
+                persist=False,
+            )
 
 
 def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
@@ -1133,6 +1195,69 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
 
         conn.commit()
         temporal_graph.write_graph()
+
+        # ------------------------------------------------------------------
+        # Phase 4c: CONCURRENT_WITH detection
+        # ------------------------------------------------------------------
+        # Find pairs of historical facts that both have a valid_period and ask the
+        # Librarian whether they overlapped in time. Confirmed pairs get bidirectional
+        # CONCURRENT_WITH edges in the temporal graph. Capped at CONCURRENT_WITH_MAX_PAIRS
+        # LLM calls per pass to prevent O(n²) runaway.
+        # ------------------------------------------------------------------
+        print("[CONSOLIDATE] Phase 4c: Detecting concurrent historical facts...")
+
+        cursor.execute(
+            "SELECT id, content, valid_period FROM atomic_facts "
+            "WHERE temporal_status = 'historical' AND valid_period IS NOT NULL"
+        )
+        hist_facts = cursor.fetchall()  # list of (id, content, valid_period)
+
+        pair_calls = 0
+        already_linked: set[frozenset] = set()
+        # Pre-populate already_linked with existing CONCURRENT_WITH pairs so we don't
+        # re-check pairs confirmed in a previous consolidation pass.
+        for u, v, edata in temporal_graph.G.edges(data=True):
+            if edata.get("relation") == "CONCURRENT_WITH":
+                already_linked.add(frozenset([u, v]))
+
+        for i in range(len(hist_facts)):
+            if pair_calls >= CONCURRENT_WITH_MAX_PAIRS:
+                print(
+                    f"[CONSOLIDATE] Phase 4c: reached cap of {CONCURRENT_WITH_MAX_PAIRS} "
+                    "pairs; remaining pairs deferred to next pass."
+                )
+                break
+            for j in range(i + 1, len(hist_facts)):
+                if pair_calls >= CONCURRENT_WITH_MAX_PAIRS:
+                    break
+                id_a, content_a, period_a = hist_facts[i]
+                id_b, content_b, period_b = hist_facts[j]
+                pair_key = frozenset([id_a, id_b])
+                if pair_key in already_linked:
+                    continue
+                decision = librarian_check_concurrency(content_a, content_b, period_a, period_b)
+                pair_calls += 1
+                if not decision or decision.outcome != "concurrent":
+                    continue
+                # Add bidirectional CONCURRENT_WITH edges.
+                temporal_graph.add_relationship(
+                    id_a, "CONCURRENT_WITH", id_b,
+                    subject_name=content_a[:80], object_name=content_b[:80],
+                    fact_ids=[id_b], persist=False,
+                )
+                temporal_graph.add_relationship(
+                    id_b, "CONCURRENT_WITH", id_a,
+                    subject_name=content_b[:80], object_name=content_a[:80],
+                    fact_ids=[id_a], persist=False,
+                )
+                already_linked.add(pair_key)
+                print(
+                    f"[CONSOLIDATE] Concurrent: '{content_a[:60]}' ↔ '{content_b[:60]}'"
+                )
+
+        if hist_facts:
+            conn.commit()
+            temporal_graph.write_graph()
 
         # ------------------------------------------------------------------
         # Phase 0: Exact-text dedup within atomic_facts
