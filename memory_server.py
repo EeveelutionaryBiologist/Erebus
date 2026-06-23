@@ -856,6 +856,31 @@ def clear_all_memories():
     return {"status": "success", "message": "All databases and graphs wiped clean."}
 
 
+def _transfer_temporal_predecessors(src_id: str, dst_id: str, dst_name: str) -> None:
+    """Copy PRECEDED_BY outgoing edges from src_id to dst_id in the temporal graph.
+
+    Called before a Phase 2 merge removes src_id so that the surviving/merged fact
+    inherits the supersession chain rather than leaving src_id as a dead node.
+    """
+    if not temporal_graph.G.has_node(src_id):
+        return
+    for _, pred_id, data in list(temporal_graph.G.out_edges(src_id, data=True)):
+        if data.get("relation") != "PRECEDED_BY":
+            continue
+        pred_name = (
+            temporal_graph.G.nodes[pred_id].get("name", pred_id)
+            if temporal_graph.G.has_node(pred_id)
+            else pred_id
+        )
+        temporal_graph.add_relationship(
+            dst_id, "PRECEDED_BY", pred_id,
+            subject_name=dst_name,
+            object_name=pred_name,
+            fact_ids=[pred_id],
+            persist=False,
+        )
+
+
 def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
     """Synchronous core of /memory/consolidate. Called by the background task runner.
 
@@ -1222,11 +1247,16 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
                         hits_j = row_j[0] if row_j else 0
 
                         drop_id = ids[j] if hits_i >= hits_j else ids[i]
+                        keep_id = ids[i] if hits_i >= hits_j else ids[j]
+                        keep_doc = docs[i] if hits_i >= hits_j else docs[j]
+
+                        _transfer_temporal_predecessors(drop_id, keep_id, keep_doc)
+
                         collection.delete(ids=[drop_id])
                         cursor.execute("DELETE FROM atomic_facts WHERE id = ?", (drop_id,))
                         conn.commit()
                         knowledge_graph.remove_fact_reference(drop_id)
-                        temporal_graph.remove_fact_reference(drop_id)
+                        temporal_graph.remove_fact_node(drop_id)
 
                         merged_out.add(ids[i])
                         merged_out.add(ids[j])
@@ -1239,17 +1269,21 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
                     if not decision or not decision.should_merge or not decision.merged_fact:
                         continue
 
+                    # Generate merged ID first so temporal history can be transferred.
+                    merged_id = str(uuid.uuid4())
+                    _transfer_temporal_predecessors(ids[i], merged_id, decision.merged_fact)
+                    _transfer_temporal_predecessors(ids[j], merged_id, decision.merged_fact)
+
                     # Remove both originals
                     collection.delete(ids=[ids[i], ids[j]])
                     cursor.execute("DELETE FROM atomic_facts WHERE id IN (?, ?)", (ids[i], ids[j]))
                     conn.commit()
                     knowledge_graph.remove_fact_reference(ids[i])
                     knowledge_graph.remove_fact_reference(ids[j])
-                    temporal_graph.remove_fact_reference(ids[i])
-                    temporal_graph.remove_fact_reference(ids[j])
+                    temporal_graph.remove_fact_node(ids[i])
+                    temporal_graph.remove_fact_node(ids[j])
 
                     # Add merged fact
-                    merged_id = str(uuid.uuid4())
                     merged_vec = get_embedding(decision.merged_fact)
                     collection.add(
                         embeddings=[merged_vec],

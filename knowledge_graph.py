@@ -200,6 +200,31 @@ class KnowledgeRelationshipGraph:
             self.G.remove_node(object_id)
         self.write_graph()
 
+    def remove_fact_node(self, node_id: str) -> None:
+        """Remove node_id as a graph node, cleaning _fact_edge_index for all incident edges.
+
+        Complements remove_fact_reference(): that method removes a fact from edge
+        source_fact_ids lists; this method removes a fact that *is itself a node*
+        (e.g. a current-state fact in the temporal graph). Call both when a fact that
+        may occupy either role is deleted.
+        """
+        if not self.G.has_node(node_id):
+            return
+        all_incident = (
+            list(self.G.out_edges(node_id, data=True, keys=True))
+            + list(self.G.in_edges(node_id, data=True, keys=True))
+        )
+        for subj, obj, key, data in all_incident:
+            for fid in list(data.get("source_fact_ids", [])):
+                entries = self._fact_edge_index.get(fid, [])
+                updated = [e for e in entries if e != (subj, obj, key)]
+                if updated:
+                    self._fact_edge_index[fid] = updated
+                else:
+                    self._fact_edge_index.pop(fid, None)
+        self.G.remove_node(node_id)
+        self.write_graph()
+
     def clear(self):
         """Wipes all nodes, edges, and the fact index, then persists the empty graph."""
         self.G.clear()
