@@ -1,26 +1,11 @@
 import json
-from pathlib import Path
 from typing import Literal
-from llama_cpp import Llama
-from huggingface_hub import hf_hub_download, snapshot_download
 from pydantic import BaseModel, Field, field_validator
 
-# TODO: Move this to a config file
-MUCH_RAM = True
-
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_DIR = BASE_DIR / "Embedding"
-
-if MUCH_RAM:
-    LIBRARIAN_MODEL_PATH = MODEL_DIR / "qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf"
-else:
-    LIBRARIAN_MODEL_PATH = MODEL_DIR / "qwen2.5-3b-instruct-q4_k_m.gguf"
-
-
-# Global variable for the model
-librarian_llm = None
+from llm_client import get_llm_client
 
 # --- PYDANTIC SCHEMAS ---
+
 class Entity(BaseModel):
     name: str
 
@@ -79,6 +64,16 @@ class SupersessionDecision(BaseModel):
         description="Brief explanation of the relationship between the two facts."
     )
 
+class GroupAssignment(BaseModel):
+    matching_groups: list[str] = Field(
+        default_factory=list,
+        description="Names of existing groups this entity belongs to. Empty list if none fit."
+    )
+    new_group: str | None = Field(
+        default=None,
+        description="Name of a new group to create, or null if an existing group covers it or no group is warranted."
+    )
+
 class ContextHint(BaseModel):
     subject: str | None = Field(
         default=None,
@@ -89,40 +84,11 @@ class ContextHint(BaseModel):
         description="The temporal setting (e.g., 'college years', '2010-2015'), or null if unknown or present-day."
     )
 
-# --- FUNCTIONS ---
-def load_librarian_model():
-    """Downloads and loads the local Librarian model permanently into RAM."""
-    global librarian_llm
-    if not LIBRARIAN_MODEL_PATH.exists():
-        print("[SYSTEM] Downloading librarian background model...")
-        MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        if MUCH_RAM:
-            snapshot_download(
-                repo_id="Qwen/Qwen2.5-7B-Instruct-GGUF",
-                local_dir=MODEL_DIR,
-                allow_patterns=["qwen2.5-7b-instruct-q4_k_m*"]
-            )
-        else:
-            hf_hub_download(
-                repo_id="Qwen/Qwen2.5-3B-Instruct-GGUF",
-                filename="qwen2.5-3b-instruct-q4_k_m.gguf",
-                local_dir=MODEL_DIR,
-            )
-    print("[SYSTEM] Initializing Llama.cpp Librarian Model in RAM...")
-    librarian_llm = Llama(
-        model_path=str(LIBRARIAN_MODEL_PATH), 
-        n_ctx=4096,
-        n_gpu_layers=0,       # Force CPU/RAM
-        use_mlock=True,       # Prevent OS swapping
-        verbose=False,
-        chat_format="chatml"  # Required for Qwen models
-    )
 
-def process_memory_chunk(text: str) -> MemoryProcessing:
+# --- INFERENCE FUNCTIONS ---
+
+def process_memory_chunk(text: str) -> MemoryProcessing | None:
     """Extracts atomic facts (for ChromaDB) AND triples (for the Graph) simultaneously."""
-    if librarian_llm is None:
-        raise ValueError("Librarian model not loaded.")
-        
     system_prompt = (
         "You are an advanced data extraction AI. You have two tasks:\n"
         "1. Extract 'atomic_facts': Break the text into independent, single-fact sentences. "
@@ -142,76 +108,58 @@ def process_memory_chunk(text: str) -> MemoryProcessing:
         "2. Extract 'triples': Subject-predicate-object relationships from the text. "
         "Use past-tense predicates (WAS, HAD) for historical facts and present-tense (IS, HAS) for current ones."
     )
-    
+
     print(f"[LIBRARIAN] Processing chunk for DBs: '{text[:50]}...'")
-    response = librarian_llm.create_chat_completion(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Process this text: '{text}'"}
-        ],
-        response_format={
-            "type": "json_object",
-            "schema": MemoryProcessing.model_json_schema()
-        },
-        temperature=0.1
-    )
-    
     try:
-        output_str = response['choices'][0]['message']['content']
-        extracted_data = json.loads(output_str)
-        return MemoryProcessing(**extracted_data)
+        output_str = get_llm_client().chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Process this text: '{text}'"},
+            ],
+            schema=MemoryProcessing.model_json_schema(),
+            temperature=0.1,
+        )
+        return MemoryProcessing(**json.loads(output_str))
     except Exception as e:
         print(f"[LIBRARIAN ERROR] Failed to process memory: {e}")
         return None
 
-def extract_entities_from_text(text: str) -> EntityExtraction:
+
+def extract_entities_from_text(text: str) -> EntityExtraction | None:
     """Pulls entities from user queries so we know which nodes to search in the Graph."""
-    if librarian_llm is None:
-        raise ValueError("Librarian model not loaded.")
-        
-    system_prompt = "Extract key nouns, proper nouns, and entities from the query."
-    
-    response = librarian_llm.create_chat_completion(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Extract entities from: '{text}'"}
-        ],
-        response_format={
-            "type": "json_object",
-            "schema": EntityExtraction.model_json_schema()
-        },
-        temperature=0.1
-    )
-    
     try:
-        output_str = response['choices'][0]['message']['content']
+        output_str = get_llm_client().chat_json(
+            messages=[
+                {"role": "system", "content": "Extract key nouns, proper nouns, and entities from the query."},
+                {"role": "user", "content": f"Extract entities from: '{text}'"},
+            ],
+            schema=EntityExtraction.model_json_schema(),
+            temperature=0.1,
+        )
         return EntityExtraction(**json.loads(output_str))
-    except Exception:
+    except Exception as e:
+        print(f"[LIBRARIAN ERROR] Entity extraction failed: {e}")
         return None
+
 
 def librarian_should_merge(fact_a: str, fact_b: str) -> MergeDecision | None:
     """Returns a merge decision for two semantically similar facts."""
-    if librarian_llm is None:
-        raise ValueError("Librarian model not loaded.")
-
     system_prompt = (
         "You are a memory deduplication engine. Given two facts, decide if they are "
         "semantically equivalent or if one is a strict subset of the other. "
         "If yes, write a single merged fact that preserves the most specific information from both. "
         "If they describe genuinely different things, do NOT merge."
     )
-
-    response = librarian_llm.create_chat_completion(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f'Fact A: "{fact_a}"\nFact B: "{fact_b}"'}
-        ],
-        response_format={"type": "json_object", "schema": MergeDecision.model_json_schema()},
-        temperature=0.1
-    )
-
     try:
-        return MergeDecision(**json.loads(response['choices'][0]['message']['content']))
+        output_str = get_llm_client().chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f'Fact A: "{fact_a}"\nFact B: "{fact_b}"'},
+            ],
+            schema=MergeDecision.model_json_schema(),
+            temperature=0.1,
+        )
+        return MergeDecision(**json.loads(output_str))
     except Exception as e:
         print(f"[LIBRARIAN ERROR] Merge decision failed: {e}")
         return None
@@ -219,9 +167,6 @@ def librarian_should_merge(fact_a: str, fact_b: str) -> MergeDecision | None:
 
 def librarian_split_compound(fact: str) -> SplitDecision | None:
     """Returns a split decision for a potentially compound fact."""
-    if librarian_llm is None:
-        raise ValueError("Librarian model not loaded.")
-
     system_prompt = (
         "You are a memory atomization engine. A fact is 'compound' if it contains two or more "
         "independent pieces of information that would each make sense as a standalone sentence. "
@@ -229,18 +174,16 @@ def librarian_split_compound(fact: str) -> SplitDecision | None:
         "Resolve all pronouns in each split so they make sense in isolation. "
         "If the statement is already a single atomic fact, set is_compound=false."
     )
-
-    response = librarian_llm.create_chat_completion(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f'Is this compound? "{fact}"'}
-        ],
-        response_format={"type": "json_object", "schema": SplitDecision.model_json_schema()},
-        temperature=0.1
-    )
-
     try:
-        return SplitDecision(**json.loads(response['choices'][0]['message']['content']))
+        output_str = get_llm_client().chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f'Is this compound? "{fact}"'},
+            ],
+            schema=SplitDecision.model_json_schema(),
+            temperature=0.1,
+        )
+        return SplitDecision(**json.loads(output_str))
     except Exception as e:
         print(f"[LIBRARIAN ERROR] Split decision failed: {e}")
         return None
@@ -252,9 +195,6 @@ def librarian_check_supersession(fact_a: str, fact_b: str) -> SupersessionDecisi
     Intended for cases where structural predicate detection (IS/WAS graph pairing) is insufficient —
     e.g., same predicate but one fact contains 'no longer' or 'used to' in the text itself.
     """
-    if librarian_llm is None:
-        raise ValueError("Librarian model not loaded.")
-
     system_prompt = (
         "You are a fact-relationship analyzer. Given two facts about the same or similar subject, "
         "classify their relationship:\n"
@@ -266,20 +206,57 @@ def librarian_check_supersession(fact_a: str, fact_b: str) -> SupersessionDecisi
         "Use 'contradiction' only for direct factual incompatibility without clear temporal ordering. "
         "When in doubt, use 'neither'."
     )
-
-    response = librarian_llm.create_chat_completion(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f'Fact A: "{fact_a}"\nFact B: "{fact_b}"'},
-        ],
-        response_format={"type": "json_object", "schema": SupersessionDecision.model_json_schema()},
-        temperature=0.1,
-    )
-
     try:
-        return SupersessionDecision(**json.loads(response["choices"][0]["message"]["content"]))
+        output_str = get_llm_client().chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f'Fact A: "{fact_a}"\nFact B: "{fact_b}"'},
+            ],
+            schema=SupersessionDecision.model_json_schema(),
+            temperature=0.1,
+        )
+        return SupersessionDecision(**json.loads(output_str))
     except Exception as e:
         print(f"[LIBRARIAN ERROR] Supersession check failed: {e}")
+        return None
+
+
+def librarian_assign_groups(entity_name: str, existing_groups: list[str]) -> GroupAssignment | None:
+    """Decides which thematic groups an entity belongs to.
+
+    Returns matching existing groups and optionally a new group name when none of the existing
+    groups fit. The Librarian should prefer reusing existing groups over creating new ones.
+    """
+    groups_list = ", ".join(f'"{g}"' for g in existing_groups) if existing_groups else "none yet"
+    system_prompt = (
+        "You are a memory organizer. Given an entity name and a list of existing thematic groups, "
+        "decide which groups this entity belongs to. Groups are broad thematic categories like "
+        "'Family', 'Friends', 'Colleagues', 'Locations', 'Organizations', 'Hobbies', 'Pets', etc.\n\n"
+        "Rules:\n"
+        "- Prefer matching existing groups over creating new ones.\n"
+        "- Only set new_group if no existing group fits and the entity clearly warrants one.\n"
+        "- Inanimate objects or abstract concepts that don't fit any category should return empty lists.\n"
+        "- An entity can match multiple groups (e.g., a person who is both a friend and a colleague)."
+    )
+    try:
+        output_str = get_llm_client().chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        f'Entity: "{entity_name}"\n'
+                        f"Existing groups: [{groups_list}]\n"
+                        "Which groups does this entity belong to?"
+                    ),
+                },
+            ],
+            schema=GroupAssignment.model_json_schema(),
+            temperature=0.1,
+        )
+        return GroupAssignment(**json.loads(output_str))
+    except Exception as e:
+        print(f"[LIBRARIAN ERROR] Group assignment failed: {e}")
         return None
 
 
@@ -287,19 +264,17 @@ def librarian_summarize(facts: list[str]) -> str:
     """Takes raw 'A [OWNS] B' facts and makes them a readable string for the main agent."""
     if not facts:
         return ""
-        
-    facts_text = "\n".join(facts)
-    system_prompt = "You are a concise AI. Combine these relational facts into a brief, human-readable summary."
-    
-    response = librarian_llm.create_chat_completion(
+    return get_llm_client().chat_text(
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Summarize these facts:\n{facts_text}"}
+            {
+                "role": "system",
+                "content": "You are a concise AI. Combine these relational facts into a brief, human-readable summary.",
+            },
+            {"role": "user", "content": f"Summarize these facts:\n{chr(10).join(facts)}"},
         ],
-        temperature=0.3
+        temperature=0.3,
     )
-    
-    return response['choices'][0]['message']['content']
+
 
 def extract_context_hint(text: str) -> ContextHint | None:
     """Extracts subject and temporal setting from the first chunk of a /learn input.
@@ -308,27 +283,22 @@ def extract_context_hint(text: str) -> ContextHint | None:
     so the Librarian can resolve pronouns and assign valid_period consistently across
     chunk boundaries. Works best for single-subject texts (biographies, diaries).
     """
-    if librarian_llm is None:
-        raise ValueError("Librarian model not loaded.")
-
     system_prompt = (
         "Extract a brief context summary from this text passage. "
         "Identify: (1) the primary subject — the person or entity the text is mainly about; "
         "(2) the temporal setting — a year range or life phase ('during college', '2010-2015') "
         "if one is clearly implied. Set both to null if genuinely unknown."
     )
-
-    response = librarian_llm.create_chat_completion(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Extract context from: '{text}'"},
-        ],
-        response_format={"type": "json_object", "schema": ContextHint.model_json_schema()},
-        temperature=0.1,
-    )
-
     try:
-        return ContextHint(**json.loads(response["choices"][0]["message"]["content"]))
+        output_str = get_llm_client().chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Extract context from: '{text}'"},
+            ],
+            schema=ContextHint.model_json_schema(),
+            temperature=0.1,
+        )
+        return ContextHint(**json.loads(output_str))
     except Exception as e:
         print(f"[LIBRARIAN ERROR] Context hint extraction failed: {e}")
         return None
@@ -344,6 +314,5 @@ def memory_consolidation_routine():
       - librarian_split_compound() → atomization: does a fact contain multiple independent claims?
 
     To trigger consolidation: POST http://localhost:8000/memory/consolidate
-    Or use the /consolidate system command from agent.py (see parse_system_prompt).
     """
     pass

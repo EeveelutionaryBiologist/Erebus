@@ -91,16 +91,28 @@ def app_client(tmp_path, monkeypatch):
     test_graph = KnowledgeRelationshipGraph(str(kg_dir / "knowledge_graph.json"))
     monkeypatch.setattr(memory_server, "knowledge_graph", test_graph)
 
+    # Fresh temporal graph
+    test_temporal_graph = KnowledgeRelationshipGraph(str(kg_dir / "temporal_graph.json"))
+    monkeypatch.setattr(memory_server, "temporal_graph", test_temporal_graph)
+
     # Stub embedding (deterministic; 768-dim matches bge-base-en-v1.5)
     monkeypatch.setattr(memory_server, "get_embedding", lambda _: [0.1] * 768)
 
     # Stub model loading so startup_event never tries to read GGUF files
     monkeypatch.setattr(memory_server, "Llama", MagicMock)
     monkeypatch.setattr(memory_server, "hf_hub_download", MagicMock())
-    monkeypatch.setattr(memory_server, "load_librarian_model", MagicMock())
+    monkeypatch.setattr(memory_server, "load_llm_client", MagicMock())
 
     # Default: no context hint (tests that need hint behaviour override this)
     monkeypatch.setattr(memory_server, "extract_context_hint", lambda text: None)
+
+    # Run background tasks synchronously so side effects are committed before
+    # the HTTP response arrives. Tests that check task results use wait_for_task().
+    monkeypatch.setattr(
+        memory_server,
+        "_run_task_in_background",
+        lambda task_id, fn, *args, **kwargs: memory_server._execute_task(task_id, fn, *args, **kwargs),
+    )
 
     with TestClient(memory_server.app) as client:
         yield client
