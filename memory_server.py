@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+import networkx as nx
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -24,6 +25,7 @@ from librarian import (
     librarian_should_merge,
     librarian_split_compound,
     librarian_check_supersession,
+    librarian_assign_groups,
     ContextHint,
 )
 from knowledge_graph import KnowledgeRelationshipGraph
@@ -73,6 +75,8 @@ def startup_event():
     # Load LLM backend (local Qwen or cloud provider per config.json)
     load_llm_client()
     _migrate_to_v2()
+    _migrate_to_v3()
+    _migrate_to_v4()
 
 def get_embedding(text: str) -> list[float]:
     response = embedder.create_embedding(text)
@@ -80,6 +84,8 @@ def get_embedding(text: str) -> list[float]:
 
 # Initialize Knowledge Graph
 knowledge_graph = KnowledgeRelationshipGraph(str(GRAPH_DIR / "knowledge_graph.json"))
+# Temporal graph: state-instance nodes (fact_ids), PRECEDED_BY edges for supersession history
+temporal_graph = KnowledgeRelationshipGraph(str(GRAPH_DIR / "temporal_graph.json"))
 
 # ==========================================
 # 3. DATABASE INITIALIZATION
@@ -101,6 +107,7 @@ def init_sqlite():
             hit_count       INTEGER DEFAULT 0,
             temporal_status TEXT DEFAULT 'current',
             valid_period    TEXT,
+            source_chunk_id TEXT REFERENCES raw_chunks(id),
             created_at      DATETIME,
             last_accessed   DATETIME
         );
@@ -114,6 +121,23 @@ def init_sqlite():
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_name_ci
             ON entities(LOWER(canonical_name));
+        CREATE TABLE IF NOT EXISTS entity_chunks (
+            entity_id  TEXT NOT NULL REFERENCES entities(id),
+            chunk_id   TEXT NOT NULL REFERENCES raw_chunks(id),
+            PRIMARY KEY (entity_id, chunk_id)
+        );
+        CREATE TABLE IF NOT EXISTS groups (
+            id         TEXT PRIMARY KEY,
+            name       TEXT NOT NULL,
+            created_at DATETIME
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_name_ci
+            ON groups(LOWER(name));
+        CREATE TABLE IF NOT EXISTS entity_groups (
+            entity_id  TEXT NOT NULL REFERENCES entities(id),
+            group_id   TEXT NOT NULL REFERENCES groups(id),
+            PRIMARY KEY (entity_id, group_id)
+        );
     """)
     conn.commit()
     return conn
@@ -188,6 +212,43 @@ def _migrate_to_v2():
         cursor.execute("ALTER TABLE atomic_facts ADD COLUMN valid_period TEXT")
     sqlite_conn.commit()
 
+def _migrate_to_v3():
+    """Adds source_chunk_id to atomic_facts and creates the entity_chunks join table."""
+    cursor = sqlite_conn.cursor()
+    cursor.execute("PRAGMA table_info(atomic_facts)")
+    existing_cols = {row[1] for row in cursor.fetchall()}
+    if "source_chunk_id" not in existing_cols:
+        cursor.execute(
+            "ALTER TABLE atomic_facts ADD COLUMN source_chunk_id TEXT REFERENCES raw_chunks(id)"
+        )
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS entity_chunks (
+            entity_id  TEXT NOT NULL REFERENCES entities(id),
+            chunk_id   TEXT NOT NULL REFERENCES raw_chunks(id),
+            PRIMARY KEY (entity_id, chunk_id)
+        )
+    """)
+    sqlite_conn.commit()
+
+def _migrate_to_v4():
+    """Creates the groups and entity_groups tables for thematic entity clustering."""
+    cursor = sqlite_conn.cursor()
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS groups (
+            id         TEXT PRIMARY KEY,
+            name       TEXT NOT NULL,
+            created_at DATETIME
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_name_ci
+            ON groups(LOWER(name));
+        CREATE TABLE IF NOT EXISTS entity_groups (
+            entity_id  TEXT NOT NULL REFERENCES entities(id),
+            group_id   TEXT NOT NULL REFERENCES groups(id),
+            PRIMARY KEY (entity_id, group_id)
+        );
+    """)
+    sqlite_conn.commit()
+
 # ---------------------------------------------------------------------------
 # Write-time normalization
 # ---------------------------------------------------------------------------
@@ -231,6 +292,23 @@ def get_or_create_entity(name: str, conn: sqlite3.Connection | None = None) -> s
     c.commit()
     return entity_id
 
+def get_or_create_group(name: str, conn: sqlite3.Connection | None = None) -> str:
+    """Returns the group UUID for `name` (case-insensitive), inserting a new row if absent."""
+    c = conn or sqlite_conn
+    cursor = c.cursor()
+    normalized = name.strip().title()
+    cursor.execute("SELECT id FROM groups WHERE LOWER(name) = LOWER(?)", (normalized,))
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+    group_id = str(uuid.uuid4())
+    cursor.execute(
+        "INSERT INTO groups (id, name, created_at) VALUES (?, ?, ?)",
+        (group_id, normalized, datetime.now().isoformat()),
+    )
+    c.commit()
+    return group_id
+
 def lookup_entity(name: str) -> str | None:
     """Returns the entity UUID for `name` (case-insensitive), or None if not found."""
     cursor = sqlite_conn.cursor()
@@ -273,6 +351,12 @@ CONTRADICTION_PREDICATE_PAIRS: list[tuple[str, str]] = [
     ("IS", "IS_NOT"),
     ("HAS", "HAS_NOT"),
 ]
+
+# Words that signal a fact describes a state that has changed. Facts containing these
+# phrases are candidates for text-based supersession checks in Phase 4b.
+SUPERSESSION_KEYWORDS: frozenset[str] = frozenset([
+    "no longer", "used to", "formerly", "previously", "once was", "not anymore",
+])
 
 # ==========================================
 # 5. ASYNC TASK INFRASTRUCTURE
@@ -397,20 +481,31 @@ def _add_memory_sync(memory: MemoryInput, conn: sqlite3.Connection) -> dict:
         collection.add(embeddings=[vector], documents=[fact.text], ids=[fact_id])
         cursor.execute(
             "INSERT INTO atomic_facts "
-            "(id, content, temporal_status, valid_period, created_at, last_accessed) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (fact_id, fact.text, fact.temporal_status, fact.valid_period, now, now)
+            "(id, content, temporal_status, valid_period, source_chunk_id, created_at, last_accessed) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (fact_id, fact.text, fact.temporal_status, fact.valid_period, raw_id, now, now)
         )
     conn.commit()
 
     # 4. Save Triples to Knowledge Graph, linked to this batch's fact IDs.
     # persist=False defers the disk write; we flush once after the loop.
+    entity_ids_in_chunk: dict[str, str] = {}  # entity_id → canonical_name
     for triple in processed_data.triples:
         subj = normalize_entity_name(triple.subject)
         obj  = normalize_entity_name(triple.object)
         pred = normalize_predicate(triple.predicate)
         subject_id = get_or_create_entity(subj, conn=conn)
         object_id  = get_or_create_entity(obj, conn=conn)
+        entity_ids_in_chunk[subject_id] = subj
+        entity_ids_in_chunk[object_id] = obj
+        cursor.execute(
+            "INSERT OR IGNORE INTO entity_chunks (entity_id, chunk_id) VALUES (?, ?)",
+            (subject_id, raw_id),
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO entity_chunks (entity_id, chunk_id) VALUES (?, ?)",
+            (object_id, raw_id),
+        )
         knowledge_graph.add_relationship(
             subject_id, pred, object_id,
             subject_name=subj, object_name=obj,
@@ -419,7 +514,35 @@ def _add_memory_sync(memory: MemoryInput, conn: sqlite3.Connection) -> dict:
         )
         print(f"  -> Graph Mapped: {subj} [{pred}] {obj}")
     if processed_data.triples:
+        conn.commit()
         knowledge_graph.write_graph()
+
+    # 5. Assign thematic groups to new entities (entities not yet in entity_groups).
+    if entity_ids_in_chunk:
+        cursor.execute("SELECT name FROM groups ORDER BY name")
+        existing_groups = [r[0] for r in cursor.fetchall()]
+        for entity_id, entity_name in entity_ids_in_chunk.items():
+            cursor.execute(
+                "SELECT COUNT(*) FROM entity_groups WHERE entity_id = ?", (entity_id,)
+            )
+            if cursor.fetchone()[0] > 0:
+                continue
+            assignment = librarian_assign_groups(entity_name, existing_groups)
+            if not assignment:
+                continue
+            for group_name in assignment.matching_groups:
+                group_id = get_or_create_group(group_name, conn=conn)
+                cursor.execute(
+                    "INSERT OR IGNORE INTO entity_groups (entity_id, group_id) VALUES (?, ?)",
+                    (entity_id, group_id),
+                )
+            if assignment.new_group:
+                group_id = get_or_create_group(assignment.new_group, conn=conn)
+                cursor.execute(
+                    "INSERT OR IGNORE INTO entity_groups (entity_id, group_id) VALUES (?, ?)",
+                    (entity_id, group_id),
+                )
+        conn.commit()
 
     return {
         "status": "success",
@@ -508,14 +631,20 @@ def search_memory(search: SearchQuery):
                 "UPDATE atomic_facts SET hit_count = hit_count + 1, last_accessed = ? WHERE id = ?",
                 (now, mem_id)
             )
-            cursor.execute("SELECT content, hit_count FROM atomic_facts WHERE id = ?", (mem_id,))
+            cursor.execute(
+                "SELECT content, hit_count, source_chunk_id FROM atomic_facts WHERE id = ?", (mem_id,)
+            )
             row = cursor.fetchone()
             if row:
-                final_results.append({"text": row[0], "hit_count": row[1]})
+                final_results.append({
+                    "id": mem_id,
+                    "text": row[0], "hit_count": row[1], "source_chunk_id": row[2],
+                })
     sqlite_conn.commit()
 
     # --- 2. GRAPH RETRIEVAL ---
     relation_facts = []
+    entity_groups_found: dict[str, list[str]] = {}  # entity_name → [group_name, ...]
     extracted = extract_entities_from_text(search.query)
 
     if extracted and hasattr(extracted, 'entities'):
@@ -530,17 +659,57 @@ def search_memory(search: SearchQuery):
                     "UPDATE entities SET hit_count = hit_count + 1, last_accessed = ? WHERE id = ?",
                     (now, entity_id)
                 )
+            cursor.execute("""
+                SELECT g.name FROM entity_groups eg
+                JOIN groups g ON eg.group_id = g.id
+                WHERE eg.entity_id = ?
+                ORDER BY g.name
+            """, (entity_id,))
+            groups = [r[0] for r in cursor.fetchall()]
+            if groups:
+                cursor.execute(
+                    "SELECT canonical_name FROM entities WHERE id = ?", (entity_id,)
+                )
+                name_row = cursor.fetchone()
+                if name_row:
+                    entity_groups_found[name_row[0]] = groups
     sqlite_conn.commit()
-    
+
     summarized_context = ""
     if relation_facts:
-        unique_facts = list(set(relation_facts)) # Deduplicate facts before summary
-        # summarized_context = librarian_summarize(unique_facts) # <--- This eats quite a lot of power...
+        unique_facts = list(set(relation_facts))
         summarized_context = "\n".join(unique_facts)
-        
+
+    # --- 3. TEMPORAL CONTEXT ---
+    # For each returned fact that appears in the temporal graph as a current-state node
+    # (i.e., has outgoing PRECEDED_BY edges), surface its historical predecessors.
+    # Predecessor texts are fetched live from SQLite; dead endpoints (fact deleted by a
+    # later consolidation phase) are silently skipped.
+    temporal_context: list[dict] = []
+    for result in final_results:
+        fact_id = result["id"]
+        if not temporal_graph.G.has_node(fact_id):
+            continue
+        ancestor_ids = nx.descendants(temporal_graph.G, fact_id)
+        if not ancestor_ids:
+            continue
+        ancestor_texts: list[str] = []
+        for anc_id in ancestor_ids:
+            cursor.execute("SELECT content FROM atomic_facts WHERE id = ?", (anc_id,))
+            anc_row = cursor.fetchone()
+            if anc_row:
+                ancestor_texts.append(anc_row[0])
+        if ancestor_texts:
+            temporal_context.append({
+                "current_fact": result["text"],
+                "preceded_by": ancestor_texts,
+            })
+
     return {
         "results": final_results,
-        "relational_context": summarized_context
+        "relational_context": summarized_context,
+        "entity_groups": entity_groups_found,
+        "temporal_context": temporal_context,
     }
 
 def _extract_entity_candidates(query: str) -> list[str]:
@@ -632,12 +801,36 @@ def get_all_memories(type: Literal["raw", "fact", "entity"] | None = None):
         results += [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": "raw"} for r in cursor.fetchall()]
 
     if type is None or type == "fact":
-        cursor.execute("SELECT id, content, hit_count, created_at FROM atomic_facts ORDER BY created_at DESC")
-        results += [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": "fact"} for r in cursor.fetchall()]
+        cursor.execute(
+            "SELECT id, content, hit_count, created_at, source_chunk_id FROM atomic_facts ORDER BY created_at DESC"
+        )
+        results += [
+            {"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3],
+             "source_chunk_id": r[4], "record_type": "fact"}
+            for r in cursor.fetchall()
+        ]
 
     if type is None or type == "entity":
-        cursor.execute("SELECT id, canonical_name, hit_count, created_at FROM entities ORDER BY created_at DESC")
-        results += [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": "entity"} for r in cursor.fetchall()]
+        cursor.execute("""
+            SELECT e.id, e.canonical_name, e.hit_count, e.created_at, COUNT(DISTINCT ec.chunk_id)
+            FROM entities e
+            LEFT JOIN entity_chunks ec ON e.id = ec.entity_id
+            GROUP BY e.id
+            ORDER BY e.created_at DESC
+        """)
+        entity_rows = cursor.fetchall()
+        for r in entity_rows:
+            cursor.execute("""
+                SELECT g.name FROM entity_groups eg
+                JOIN groups g ON eg.group_id = g.id
+                WHERE eg.entity_id = ?
+                ORDER BY g.name
+            """, (r[0],))
+            groups = [row[0] for row in cursor.fetchall()]
+            results.append({
+                "id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3],
+                "chunk_count": r[4], "groups": groups, "record_type": "entity",
+            })
 
     return {"results": results}
 
@@ -656,9 +849,10 @@ def clear_all_memories():
     chroma_client.delete_collection("nyxx_memory")
     collection = chroma_client.create_collection("nyxx_memory")
     
-    # 3. Clear Graph
+    # 3. Clear Graphs
     knowledge_graph.clear()
-    
+    temporal_graph.clear()
+
     return {"status": "success", "message": "All databases and graphs wiped clean."}
 
 
@@ -689,6 +883,9 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
     # Fact IDs involved in a detected contradiction — protected from Phase 2 dedup since they
     # are intentionally distinct facts, not duplicates.
     protected_fact_ids: set[str] = set()
+    # Fact-ID pairs already sent to librarian_check_supersession for text-based checks.
+    # Prevents re-checking the same pair across multiple consolidation passes.
+    flagged_text_pairs: set[tuple[str, str]] = set()
 
     for _N in range(CONSOLIDATION_PASSES):
         # ------------------------------------------------------------------
@@ -716,6 +913,12 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
                 for past_pred, present_pred in TEMPORAL_PREDICATE_PAIRS.items():
                     if past_pred not in predicate_map or present_pred not in predicate_map:
                         continue
+                    # Collect present-state fact IDs once per predicate pair for temporal linking.
+                    current_fact_ids_for_pair: list[str] = []
+                    for present_edge_data in predicate_map[present_pred]:
+                        current_fact_ids_for_pair.extend(
+                            present_edge_data.get("source_fact_ids", [])
+                        )
                     for edge_data in predicate_map[past_pred]:
                         for fact_id in edge_data.get("source_fact_ids", []):
                             cursor.execute(
@@ -728,6 +931,26 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
                                     (fact_id,),
                                 )
                                 report["superseded"] += 1
+                                # Temporal graph: current -[PRECEDED_BY]-> past
+                                cursor.execute(
+                                    "SELECT content FROM atomic_facts WHERE id = ?", (fact_id,)
+                                )
+                                past_row = cursor.fetchone()
+                                past_name = past_row[0][:80] if past_row else fact_id[:8]
+                                for current_fact_id in current_fact_ids_for_pair:
+                                    if current_fact_id == fact_id:
+                                        continue
+                                    cursor.execute(
+                                        "SELECT content FROM atomic_facts WHERE id = ?",
+                                        (current_fact_id,),
+                                    )
+                                    cur_row = cursor.fetchone()
+                                    cur_name = cur_row[0][:80] if cur_row else current_fact_id[:8]
+                                    temporal_graph.add_relationship(
+                                        current_fact_id, "PRECEDED_BY", fact_id,
+                                        subject_name=cur_name, object_name=past_name,
+                                        fact_ids=[fact_id], persist=False,
+                                    )
                                 print(
                                     f"[CONSOLIDATE] Superseded: {subj_name} [{past_pred}] {obj_name} "
                                     f"(fact {fact_id[:8]}…) overridden by [{present_pred}] edge."
@@ -774,6 +997,119 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
         conn.commit()
 
         # ------------------------------------------------------------------
+        # Phase 4b: Text-based supersession via librarian_check_supersession
+        # Handles same-predicate or KG-absent cases where the fact text itself
+        # signals state change ("no longer", "used to", etc.).
+        # ------------------------------------------------------------------
+        print("[CONSOLIDATE] Phase 4b: Text-based supersession detection...")
+
+        cursor.execute(
+            "SELECT id, content FROM atomic_facts WHERE temporal_status != 'historical'"
+        )
+        current_facts = cursor.fetchall()
+
+        keyword_facts = [
+            (fid, text) for fid, text in current_facts
+            if any(kw in text.lower() for kw in SUPERSESSION_KEYWORDS)
+            and fid not in protected_fact_ids
+        ]
+
+        for fact_id, fact_text in keyword_facts:
+            # Re-check: a prior iteration may have already marked this fact historical.
+            cursor.execute(
+                "SELECT temporal_status FROM atomic_facts WHERE id = ?", (fact_id,)
+            )
+            row = cursor.fetchone()
+            if not row or row[0] == "historical":
+                continue
+
+            n_available = collection.count()
+            if n_available < 2:
+                continue
+            try:
+                query_result = collection.query(
+                    query_embeddings=[get_embedding(fact_text)],
+                    n_results=min(5, n_available),
+                )
+            except Exception:
+                continue
+
+            neighbor_ids = query_result["ids"][0] if query_result["ids"] else []
+            neighbor_docs = query_result["documents"][0] if query_result["documents"] else []
+
+            for neighbor_id, neighbor_text in zip(neighbor_ids, neighbor_docs):
+                if neighbor_id == fact_id:
+                    continue
+                if neighbor_id in protected_fact_ids:
+                    continue
+
+                pair_key = tuple(sorted((fact_id, neighbor_id)))
+                if pair_key in flagged_text_pairs:
+                    continue
+                flagged_text_pairs.add(pair_key)
+
+                cursor.execute(
+                    "SELECT temporal_status FROM atomic_facts WHERE id = ?", (neighbor_id,)
+                )
+                row = cursor.fetchone()
+                if not row or row[0] == "historical":
+                    continue
+
+                decision = librarian_check_supersession(fact_text, neighbor_text)
+                if not decision:
+                    continue
+
+                if decision.outcome == "A_supersedes_B":
+                    cursor.execute(
+                        "UPDATE atomic_facts SET temporal_status = 'historical' WHERE id = ?",
+                        (neighbor_id,),
+                    )
+                    report["superseded"] += 1
+                    # fact_id (A) is the current state; neighbor_id (B) is the past state
+                    temporal_graph.add_relationship(
+                        fact_id, "PRECEDED_BY", neighbor_id,
+                        subject_name=fact_text[:80], object_name=neighbor_text[:80],
+                        fact_ids=[neighbor_id], persist=False,
+                    )
+                    print(
+                        f"[CONSOLIDATE] Text supersession: "
+                        f"'{fact_text[:60]}' supersedes '{neighbor_text[:60]}'"
+                    )
+                elif decision.outcome == "B_supersedes_A":
+                    cursor.execute(
+                        "UPDATE atomic_facts SET temporal_status = 'historical' WHERE id = ?",
+                        (fact_id,),
+                    )
+                    report["superseded"] += 1
+                    # neighbor_id (B) is the current state; fact_id (A) is the past state
+                    temporal_graph.add_relationship(
+                        neighbor_id, "PRECEDED_BY", fact_id,
+                        subject_name=neighbor_text[:80], object_name=fact_text[:80],
+                        fact_ids=[fact_id], persist=False,
+                    )
+                    print(
+                        f"[CONSOLIDATE] Text supersession: "
+                        f"'{neighbor_text[:60]}' supersedes '{fact_text[:60]}'"
+                    )
+                    break
+                elif decision.outcome == "contradiction":
+                    protected_fact_ids.add(fact_id)
+                    protected_fact_ids.add(neighbor_id)
+                    report["flagged"].append({
+                        "type": "contradiction",
+                        "source": "text_based",
+                        "fact_a": fact_text,
+                        "fact_b": neighbor_text,
+                    })
+                    print(
+                        f"[CONSOLIDATE] Text contradiction: "
+                        f"'{fact_text[:60]}' vs '{neighbor_text[:60]}'"
+                    )
+
+        conn.commit()
+        temporal_graph.write_graph()
+
+        # ------------------------------------------------------------------
         # Phase 0: Exact-text dedup within atomic_facts
         # ------------------------------------------------------------------
         print("[CONSOLIDATE] Phase 0: Exact-text dedup in atomic_facts...")
@@ -800,6 +1136,7 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
             collection.delete(ids=drop_fact_ids)
             for cid in drop_fact_ids:
                 knowledge_graph.remove_fact_reference(cid)
+                temporal_graph.remove_fact_reference(cid)
             cursor.execute(
                 f"DELETE FROM atomic_facts WHERE id IN ({','.join('?' * len(drop_fact_ids))})",
                 drop_fact_ids
@@ -829,6 +1166,7 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
             conn.commit()
             for fact_id in stale_fact_ids:
                 knowledge_graph.remove_fact_reference(fact_id)
+                temporal_graph.remove_fact_reference(fact_id)
             report["pruned"] += len(stale_fact_ids)
             print(f"[CONSOLIDATE] Pruned {len(stale_fact_ids)} stale facts.")
 
@@ -888,6 +1226,7 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
                         cursor.execute("DELETE FROM atomic_facts WHERE id = ?", (drop_id,))
                         conn.commit()
                         knowledge_graph.remove_fact_reference(drop_id)
+                        temporal_graph.remove_fact_reference(drop_id)
 
                         merged_out.add(ids[i])
                         merged_out.add(ids[j])
@@ -906,6 +1245,8 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
                     conn.commit()
                     knowledge_graph.remove_fact_reference(ids[i])
                     knowledge_graph.remove_fact_reference(ids[j])
+                    temporal_graph.remove_fact_reference(ids[i])
+                    temporal_graph.remove_fact_reference(ids[j])
 
                     # Add merged fact
                     merged_id = str(uuid.uuid4())
@@ -953,6 +1294,7 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
             collection.delete(ids=[fact_id])
             cursor.execute("DELETE FROM atomic_facts WHERE id = ?", (fact_id,))
             knowledge_graph.remove_fact_reference(fact_id)
+            temporal_graph.remove_fact_reference(fact_id)
 
             for split_fact in decision.split_facts:
                 split_id = str(uuid.uuid4())
@@ -976,6 +1318,15 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
                 knowledge_graph.G.remove_node(node)
             knowledge_graph.write_graph()
             print(f"[CONSOLIDATE] Removed {len(orphaned)} orphaned KG nodes.")
+
+        temp_orphaned = [
+            n for n in list(temporal_graph.G.nodes()) if temporal_graph.G.degree(n) == 0
+        ]
+        if temp_orphaned:
+            for node in temp_orphaned:
+                temporal_graph.G.remove_node(node)
+            temporal_graph.write_graph()
+            print(f"[CONSOLIDATE] Removed {len(temp_orphaned)} orphaned temporal graph nodes.")
 
     print(f"[CONSOLIDATE] Done. {report}")
     return {"status": "success", "report": report}

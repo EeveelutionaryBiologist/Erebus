@@ -91,6 +91,10 @@ def app_client(tmp_path, monkeypatch):
     test_graph = KnowledgeRelationshipGraph(str(kg_dir / "knowledge_graph.json"))
     monkeypatch.setattr(memory_server, "knowledge_graph", test_graph)
 
+    # Fresh temporal graph
+    test_temporal_graph = KnowledgeRelationshipGraph(str(kg_dir / "temporal_graph.json"))
+    monkeypatch.setattr(memory_server, "temporal_graph", test_temporal_graph)
+
     # Stub embedding (deterministic; 768-dim matches bge-base-en-v1.5)
     monkeypatch.setattr(memory_server, "get_embedding", lambda _: [0.1] * 768)
 

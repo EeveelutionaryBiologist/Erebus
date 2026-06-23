@@ -64,6 +64,16 @@ class SupersessionDecision(BaseModel):
         description="Brief explanation of the relationship between the two facts."
     )
 
+class GroupAssignment(BaseModel):
+    matching_groups: list[str] = Field(
+        default_factory=list,
+        description="Names of existing groups this entity belongs to. Empty list if none fit."
+    )
+    new_group: str | None = Field(
+        default=None,
+        description="Name of a new group to create, or null if an existing group covers it or no group is warranted."
+    )
+
 class ContextHint(BaseModel):
     subject: str | None = Field(
         default=None,
@@ -208,6 +218,45 @@ def librarian_check_supersession(fact_a: str, fact_b: str) -> SupersessionDecisi
         return SupersessionDecision(**json.loads(output_str))
     except Exception as e:
         print(f"[LIBRARIAN ERROR] Supersession check failed: {e}")
+        return None
+
+
+def librarian_assign_groups(entity_name: str, existing_groups: list[str]) -> GroupAssignment | None:
+    """Decides which thematic groups an entity belongs to.
+
+    Returns matching existing groups and optionally a new group name when none of the existing
+    groups fit. The Librarian should prefer reusing existing groups over creating new ones.
+    """
+    groups_list = ", ".join(f'"{g}"' for g in existing_groups) if existing_groups else "none yet"
+    system_prompt = (
+        "You are a memory organizer. Given an entity name and a list of existing thematic groups, "
+        "decide which groups this entity belongs to. Groups are broad thematic categories like "
+        "'Family', 'Friends', 'Colleagues', 'Locations', 'Organizations', 'Hobbies', 'Pets', etc.\n\n"
+        "Rules:\n"
+        "- Prefer matching existing groups over creating new ones.\n"
+        "- Only set new_group if no existing group fits and the entity clearly warrants one.\n"
+        "- Inanimate objects or abstract concepts that don't fit any category should return empty lists.\n"
+        "- An entity can match multiple groups (e.g., a person who is both a friend and a colleague)."
+    )
+    try:
+        output_str = get_llm_client().chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        f'Entity: "{entity_name}"\n'
+                        f"Existing groups: [{groups_list}]\n"
+                        "Which groups does this entity belong to?"
+                    ),
+                },
+            ],
+            schema=GroupAssignment.model_json_schema(),
+            temperature=0.1,
+        )
+        return GroupAssignment(**json.loads(output_str))
+    except Exception as e:
+        print(f"[LIBRARIAN ERROR] Group assignment failed: {e}")
         return None
 
 

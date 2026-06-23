@@ -27,6 +27,7 @@ from librarian import (
     ContextHint,
     EntityExtraction,
     Entity,
+    GroupAssignment,
     MemoryProcessing,
     KnowledgeTriple,
     MergeDecision,
@@ -470,6 +471,544 @@ class TestConsolidateMemories:
         # Chunk-granularity limitation: "Hailey owns a dog." shares batch fact_ids
         # with the WAS-Fencer edge and is incorrectly marked historical.
         assert rows.get("Hailey owns a dog.") == "historical"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4b: Text-based supersession via librarian_check_supersession
+# ---------------------------------------------------------------------------
+
+class TestConsolidatePhase4b:
+    def _stub_consolidation_helpers(self, monkeypatch):
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+
+    def test_phase4b_a_supersedes_b_marks_neighbor_historical(self, app_client, monkeypatch):
+        """Keyword fact (A) superseding neighbor (B) marks B historical."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=[AtomicFact(text="Alice no longer works at Google.")],
+                    triples=[],
+                )
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Alice works at Google.")],
+                triples=[],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr(
+            "memory_server.librarian_check_supersession",
+            lambda a, b: SupersessionDecision(outcome="A_supersedes_B"),
+        )
+        self._stub_consolidation_helpers(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        assert resp.status_code == 202
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        assert task["result"]["report"]["superseded"] >= 1
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT content, temporal_status FROM atomic_facts")
+        rows = dict(cursor.fetchall())
+        assert rows.get("Alice works at Google.") == "historical"
+        assert rows.get("Alice no longer works at Google.") == "current"
+
+    def test_phase4b_b_supersedes_a_marks_keyword_fact_historical(self, app_client, monkeypatch):
+        """When the neighbor (B) supersedes the keyword fact (A), A becomes historical."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=[AtomicFact(text="Alice previously worked at Google.")],
+                    triples=[],
+                )
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Alice works at MegaCorp.")],
+                triples=[],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr(
+            "memory_server.librarian_check_supersession",
+            lambda a, b: SupersessionDecision(outcome="B_supersedes_A"),
+        )
+        self._stub_consolidation_helpers(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["result"]["report"]["superseded"] >= 1
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT content, temporal_status FROM atomic_facts")
+        rows = dict(cursor.fetchall())
+        assert rows.get("Alice previously worked at Google.") == "historical"
+        assert rows.get("Alice works at MegaCorp.") == "current"
+
+    def test_phase4b_no_keywords_librarian_not_called(self, app_client, monkeypatch):
+        """Facts with no supersession keywords never trigger librarian_check_supersession."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text):
+            call_count[0] += 1
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text=f"Bob likes pizza (variant {call_count[0]}).")],
+                triples=[],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        librarian_calls = [0]
+
+        def tracking_supersession(a, b):
+            librarian_calls[0] += 1
+            return SupersessionDecision(outcome="neither")
+
+        monkeypatch.setattr("memory_server.librarian_check_supersession", tracking_supersession)
+        self._stub_consolidation_helpers(monkeypatch)
+
+        app_client.post("/memory/consolidate")
+
+        assert librarian_calls[0] == 0
+
+    def test_phase4b_contradiction_flagged_with_text_source(self, app_client, monkeypatch):
+        """Text-based contradictions appear in flagged list with source='text_based'."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=[AtomicFact(text="Alice formerly ran marathons.")],
+                    triples=[],
+                )
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Alice runs marathons every year.")],
+                triples=[],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr(
+            "memory_server.librarian_check_supersession",
+            lambda a, b: SupersessionDecision(outcome="contradiction"),
+        )
+        self._stub_consolidation_helpers(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        flagged = task["result"]["report"]["flagged"]
+
+        text_based = [f for f in flagged if f.get("source") == "text_based"]
+        assert len(text_based) >= 1
+        entry = text_based[0]
+        assert entry["type"] == "contradiction"
+        assert "fact_a" in entry and "fact_b" in entry
+
+    def test_phase4b_neither_outcome_does_not_supersede(self, app_client, monkeypatch):
+        """A 'neither' outcome from the librarian leaves the report superseded count unchanged."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=[AtomicFact(text="Bob used to live in Berlin.")],
+                    triples=[],
+                )
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Bob now lives in London.")],
+                triples=[],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr(
+            "memory_server.librarian_check_supersession",
+            lambda a, b: SupersessionDecision(outcome="neither"),
+        )
+        self._stub_consolidation_helpers(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        report = task["result"]["report"]
+
+        # Phase 4b "neither" adds no supersessions and no text_based flagged entries.
+        assert report["superseded"] == 0
+        assert not any(f.get("source") == "text_based" for f in report["flagged"])
+
+        # The keyword fact itself must not have been marked historical by Phase 4b.
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "SELECT temporal_status FROM atomic_facts WHERE content = 'Bob used to live in Berlin.'"
+        )
+        row = cursor.fetchone()
+        # The keyword fact either still exists (current) or was merged by Phase 2 (also fine).
+        # Either way, Phase 4b did not touch it — so if it exists, it must be 'current'.
+        if row:
+            assert row[0] == "current"
+
+    def test_phase4b_pair_not_rechecked_across_passes(self, app_client, monkeypatch):
+        """The same fact pair is only sent to librarian_check_supersession once across all passes."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=[AtomicFact(text="Carol formerly studied chemistry.")],
+                    triples=[],
+                )
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Carol studies biology.")],
+                triples=[],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        librarian_calls = [0]
+
+        def counting_supersession(a, b):
+            librarian_calls[0] += 1
+            return SupersessionDecision(outcome="neither")
+
+        monkeypatch.setattr("memory_server.librarian_check_supersession", counting_supersession)
+        self._stub_consolidation_helpers(monkeypatch)
+
+        app_client.post("/memory/consolidate")
+
+        # With CONSOLIDATION_PASSES = 2, the pair should still only be checked once.
+        assert librarian_calls[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Source chunk linkage
+# ---------------------------------------------------------------------------
+
+class TestSourceChunkLinkage:
+    def test_add_populates_source_chunk_id_on_facts(self, app_client, monkeypatch):
+        """Each atomic fact row should reference the raw_chunk that produced it."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["Alice owns a bakery.", "Alice lives in Paris."],
+                triples=[],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "Alice owns a bakery. Alice lives in Paris."})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT id FROM raw_chunks")
+        raw_id = cursor.fetchone()[0]
+
+        cursor.execute("SELECT content, source_chunk_id FROM atomic_facts ORDER BY content")
+        rows = {r[0]: r[1] for r in cursor.fetchall()}
+        assert rows["Alice lives in Paris."] == raw_id
+        assert rows["Alice owns a bakery."] == raw_id
+
+    def test_add_populates_entity_chunks_for_triple_subjects_and_objects(self, app_client, monkeypatch):
+        """entity_chunks rows are created for both the subject and object of each triple."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["Alice owns a bakery."],
+                triples=[KnowledgeTriple(subject="Alice", predicate="OWNS", object="Bakery")],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "Alice owns a bakery."})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT id FROM raw_chunks")
+        raw_id = cursor.fetchone()[0]
+
+        cursor.execute("""
+            SELECT e.canonical_name FROM entity_chunks ec
+            JOIN entities e ON ec.entity_id = e.id
+            WHERE ec.chunk_id = ?
+            ORDER BY e.canonical_name
+        """, (raw_id,))
+        names = [r[0] for r in cursor.fetchall()]
+        assert "Alice" in names
+        assert "Bakery" in names
+
+    def test_entity_chunks_dedup_across_multiple_chunks(self, app_client, monkeypatch):
+        """Same entity appearing in two chunks creates two entity_chunks rows, not one."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_triple(_text):
+            call_count[0] += 1
+            pred = "OWNS" if call_count[0] == 1 else "LIVES_IN"
+            obj = "Bakery" if call_count[0] == 1 else "Paris"
+            return MemoryProcessing(
+                atomic_facts=[f"Alice {pred.lower()} {obj}."],
+                triples=[KnowledgeTriple(subject="Alice", predicate=pred, object=obj)],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_triple)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM entity_chunks ec JOIN entities e ON ec.entity_id = e.id "
+            "WHERE LOWER(e.canonical_name) = 'alice'"
+        )
+        count = cursor.fetchone()[0]
+        assert count == 2
+
+    def test_all_facts_response_includes_source_chunk_id(self, app_client, monkeypatch):
+        """GET /memory/all?type=fact returns source_chunk_id on every fact record."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(atomic_facts=["Bob drinks coffee."], triples=[]),
+        )
+        app_client.post("/memory/add", json={"text": "Bob drinks coffee."})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT id FROM raw_chunks")
+        raw_id = cursor.fetchone()[0]
+
+        resp = app_client.get("/memory/all?type=fact")
+        facts = resp.json()["results"]
+        assert len(facts) == 1
+        assert facts[0]["source_chunk_id"] == raw_id
+
+    def test_all_entities_response_includes_chunk_count(self, app_client, monkeypatch):
+        """GET /memory/all?type=entity returns chunk_count showing how many chunks reference it."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_triple(_text):
+            call_count[0] += 1
+            pred = "OWNS" if call_count[0] == 1 else "LIKES"
+            return MemoryProcessing(
+                atomic_facts=[f"Alice {pred.lower()} something."],
+                triples=[KnowledgeTriple(subject="Alice", predicate=pred, object="Something")],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_triple)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        resp = app_client.get("/memory/all?type=entity")
+        entities = resp.json()["results"]
+        alice = next(e for e in entities if e["text"] == "Alice")
+        # Alice appears in two chunks.
+        assert alice["chunk_count"] == 2
+
+    def test_search_response_includes_source_chunk_id(self, app_client, monkeypatch):
+        """POST /memory/search results include source_chunk_id on each fact."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(atomic_facts=["Carol is a scientist."], triples=[]),
+        )
+        monkeypatch.setattr(
+            "memory_server.extract_entities_from_text",
+            lambda q: None,
+        )
+        app_client.post("/memory/add", json={"text": "Carol is a scientist."})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT id FROM raw_chunks")
+        raw_id = cursor.fetchone()[0]
+
+        resp = app_client.post("/memory/search", json={"query": "Carol scientist", "top_k": 1})
+        results = resp.json()["results"]
+        assert len(results) == 1
+        assert results[0]["source_chunk_id"] == raw_id
+
+
+# ---------------------------------------------------------------------------
+# Tags / Groups
+# ---------------------------------------------------------------------------
+
+class TestEntityGroups:
+    def test_add_assigns_matching_existing_group(self, app_client, monkeypatch):
+        """When librarian_assign_groups returns a matching existing group, entity is linked to it."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["Alice is a doctor."],
+                triples=[KnowledgeTriple(subject="Alice", predicate="IS", object="Doctor")],
+            ),
+        )
+        monkeypatch.setattr(
+            "memory_server.librarian_assign_groups",
+            lambda name, groups: GroupAssignment(matching_groups=["Family"], new_group=None),
+        )
+        # Seed an existing group so the Librarian can "find" it.
+        cursor = memory_server.sqlite_conn.cursor()
+        family_id = str(__import__("uuid").uuid4())
+        cursor.execute(
+            "INSERT INTO groups (id, name, created_at) VALUES (?, 'Family', '2020-01-01')",
+            (family_id,),
+        )
+        memory_server.sqlite_conn.commit()
+
+        app_client.post("/memory/add", json={"text": "Alice is a doctor."})
+
+        cursor.execute("""
+            SELECT g.name FROM entity_groups eg
+            JOIN entities e ON eg.entity_id = e.id
+            JOIN groups g ON eg.group_id = g.id
+            WHERE LOWER(e.canonical_name) = 'alice'
+        """)
+        group_names = [r[0] for r in cursor.fetchall()]
+        assert "Family" in group_names
+
+    def test_add_creates_new_group_when_none_match(self, app_client, monkeypatch):
+        """When librarian_assign_groups proposes a new_group, the group is created."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["Mochi is a cat."],
+                triples=[KnowledgeTriple(subject="Mochi", predicate="IS", object="Cat")],
+            ),
+        )
+        monkeypatch.setattr(
+            "memory_server.librarian_assign_groups",
+            lambda name, groups: GroupAssignment(matching_groups=[], new_group="Pets"),
+        )
+        app_client.post("/memory/add", json={"text": "Mochi is a cat."})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("""
+            SELECT g.name FROM entity_groups eg
+            JOIN entities e ON eg.entity_id = e.id
+            JOIN groups g ON eg.group_id = g.id
+            WHERE LOWER(e.canonical_name) = 'mochi'
+        """)
+        group_names = [r[0] for r in cursor.fetchall()]
+        assert "Pets" in group_names
+
+        cursor.execute("SELECT name FROM groups WHERE LOWER(name) = 'pets'")
+        assert cursor.fetchone() is not None
+
+    def test_add_skips_group_assignment_for_known_entity(self, app_client, monkeypatch):
+        """If an entity already has group assignments, librarian_assign_groups is not called again."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text):
+            return MemoryProcessing(
+                atomic_facts=["Alice works here."],
+                triples=[KnowledgeTriple(subject="Alice", predicate="WORKS_AT", object="Lab")],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+
+        librarian_calls = [0]
+
+        def counting_assign(name, groups):
+            librarian_calls[0] += 1
+            return GroupAssignment(matching_groups=[], new_group="Friends")
+
+        monkeypatch.setattr("memory_server.librarian_assign_groups", counting_assign)
+
+        # First /add — Alice is new, should call librarian_assign_groups.
+        app_client.post("/memory/add", json={"text": "first"})
+        first_call_count = librarian_calls[0]
+
+        # Second /add — Alice already has a group, should NOT call again.
+        app_client.post("/memory/add", json={"text": "second"})
+        assert librarian_calls[0] == first_call_count
+
+    def test_all_entities_includes_groups(self, app_client, monkeypatch):
+        """GET /memory/all?type=entity returns a groups list for each entity."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["Bob owns a bakery."],
+                triples=[KnowledgeTriple(subject="Bob", predicate="OWNS", object="Bakery")],
+            ),
+        )
+        monkeypatch.setattr(
+            "memory_server.librarian_assign_groups",
+            lambda name, groups: GroupAssignment(matching_groups=[], new_group="Friends"),
+        )
+        app_client.post("/memory/add", json={"text": "Bob owns a bakery."})
+
+        resp = app_client.get("/memory/all?type=entity")
+        entities = resp.json()["results"]
+        bob = next((e for e in entities if e["text"] == "Bob"), None)
+        assert bob is not None
+        assert "groups" in bob
+        assert "Friends" in bob["groups"]
+
+    def test_search_includes_entity_groups(self, app_client, monkeypatch):
+        """POST /memory/search returns entity_groups when known entities are found in the KG."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["Carol is a scientist."],
+                triples=[KnowledgeTriple(subject="Carol", predicate="IS", object="Scientist")],
+            ),
+        )
+        monkeypatch.setattr(
+            "memory_server.librarian_assign_groups",
+            lambda name, groups: GroupAssignment(matching_groups=[], new_group="Colleagues"),
+        )
+        app_client.post("/memory/add", json={"text": "Carol is a scientist."})
+
+        monkeypatch.setattr(
+            "memory_server.extract_entities_from_text",
+            lambda q: EntityExtraction(entities=[Entity(name="Carol")]),
+        )
+        resp = app_client.post("/memory/search", json={"query": "Carol"})
+        entity_groups = resp.json()["entity_groups"]
+        assert "Carol" in entity_groups
+        assert "Colleagues" in entity_groups["Carol"]
 
 
 # ---------------------------------------------------------------------------
@@ -981,3 +1520,272 @@ class TestLearnEndpoint:
         app_client.post("/memory/learn", json={"text": sentences})
         for text in received:
             assert not text.startswith("[CONTEXT:")
+
+
+# ---------------------------------------------------------------------------
+# Temporal relationship graph (Layer 2)
+# ---------------------------------------------------------------------------
+
+class TestTemporalGraph:
+    """Tests for the temporal_graph PRECEDED_BY edge population and /memory/search integration."""
+
+    def _stub_consolidation_helpers(self, monkeypatch):
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+
+    def test_phase4_structural_creates_preceded_by_edge(self, app_client, monkeypatch):
+        """Phase 4 structural supersession adds current -[PRECEDED_BY]-> past in temporal_graph."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=[AtomicFact(text="Alice was a nurse.")],
+                    triples=[KnowledgeTriple(subject="Alice", predicate="WAS", object="Nurse")],
+                )
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Alice is a doctor.")],
+                triples=[KnowledgeTriple(subject="Alice", predicate="IS", object="Nurse")],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        self._stub_consolidation_helpers(monkeypatch)
+        app_client.post("/memory/consolidate")
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT id FROM atomic_facts WHERE content = 'Alice was a nurse.'")
+        past_id = cursor.fetchone()[0]
+        cursor.execute("SELECT id FROM atomic_facts WHERE content = 'Alice is a doctor.'")
+        current_id = cursor.fetchone()[0]
+
+        tg = memory_server.temporal_graph
+        assert tg.G.has_node(current_id), "current fact should be a node in temporal_graph"
+        assert tg.G.has_node(past_id), "past fact should be a node in temporal_graph"
+        assert tg.G.has_edge(current_id, past_id), "current -[PRECEDED_BY]-> past edge should exist"
+        edge_data = next(iter(tg.G[current_id][past_id].values()))
+        assert edge_data.get("relation") == "PRECEDED_BY"
+
+    def test_phase4b_a_supersedes_b_creates_preceded_by_edge(self, app_client, monkeypatch):
+        """Phase 4b A_supersedes_B creates: keyword_fact -[PRECEDED_BY]-> neighbor in temporal_graph."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=[AtomicFact(text="Alice no longer works at Google.")],
+                    triples=[],
+                )
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Alice works at Google.")],
+                triples=[],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr(
+            "memory_server.librarian_check_supersession",
+            lambda a, b: SupersessionDecision(outcome="A_supersedes_B"),
+        )
+        self._stub_consolidation_helpers(monkeypatch)
+        app_client.post("/memory/consolidate")
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "SELECT id FROM atomic_facts WHERE content = 'Alice no longer works at Google.'"
+        )
+        keyword_id = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT id FROM atomic_facts WHERE content = 'Alice works at Google.'"
+        )
+        neighbor_id = cursor.fetchone()[0]
+
+        tg = memory_server.temporal_graph
+        assert tg.G.has_edge(keyword_id, neighbor_id), \
+            "keyword_fact -[PRECEDED_BY]-> neighbor should be added when A supersedes B"
+        edge_data = next(iter(tg.G[keyword_id][neighbor_id].values()))
+        assert edge_data.get("relation") == "PRECEDED_BY"
+        assert neighbor_id in edge_data.get("source_fact_ids", [])
+
+    def test_phase4b_b_supersedes_a_creates_preceded_by_edge(self, app_client, monkeypatch):
+        """Phase 4b B_supersedes_A creates: neighbor -[PRECEDED_BY]-> keyword_fact in temporal_graph."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=[AtomicFact(text="Alice no longer works at Google.")],
+                    triples=[],
+                )
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Alice works at Google.")],
+                triples=[],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr(
+            "memory_server.librarian_check_supersession",
+            lambda a, b: SupersessionDecision(outcome="B_supersedes_A"),
+        )
+        self._stub_consolidation_helpers(monkeypatch)
+        app_client.post("/memory/consolidate")
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "SELECT id FROM atomic_facts WHERE content = 'Alice no longer works at Google.'"
+        )
+        keyword_id = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT id FROM atomic_facts WHERE content = 'Alice works at Google.'"
+        )
+        neighbor_id = cursor.fetchone()[0]
+
+        tg = memory_server.temporal_graph
+        assert tg.G.has_edge(neighbor_id, keyword_id), \
+            "neighbor -[PRECEDED_BY]-> keyword_fact should be added when B supersedes A"
+        edge_data = next(iter(tg.G[neighbor_id][keyword_id].values()))
+        assert edge_data.get("relation") == "PRECEDED_BY"
+        assert keyword_id in edge_data.get("source_fact_ids", [])
+
+    def test_search_returns_temporal_context(self, app_client, monkeypatch):
+        """POST /memory/search includes temporal_context for facts with PRECEDED_BY history."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=[AtomicFact(text="Alice was a nurse.")],
+                    triples=[KnowledgeTriple(subject="Alice", predicate="WAS", object="Nurse")],
+                )
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Alice is a doctor.")],
+                triples=[KnowledgeTriple(subject="Alice", predicate="IS", object="Nurse")],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        monkeypatch.setattr(
+            "memory_server.librarian_assign_groups", lambda name, groups: None
+        )
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        self._stub_consolidation_helpers(monkeypatch)
+        app_client.post("/memory/consolidate")
+
+        monkeypatch.setattr(
+            "memory_server.extract_entities_from_text", lambda q: None
+        )
+        resp = app_client.post("/memory/search", json={"query": "Alice job", "top_k": 5})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "temporal_context" in body
+
+        # The current fact ("Alice is a doctor.") should have "Alice was a nurse." as history.
+        tc = body["temporal_context"]
+        doctor_entry = next(
+            (e for e in tc if e["current_fact"] == "Alice is a doctor."), None
+        )
+        assert doctor_entry is not None, "temporal_context should include Alice is a doctor."
+        assert "Alice was a nurse." in doctor_entry["preceded_by"]
+
+    def test_search_results_include_fact_id(self, app_client, monkeypatch):
+        """POST /memory/search results now include an 'id' field for each fact."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(atomic_facts=["Alice runs a bakery."], triples=[]),
+        )
+        monkeypatch.setattr("memory_server.extract_entities_from_text", lambda q: None)
+        app_client.post("/memory/add", json={"text": "Alice runs a bakery."})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT id FROM atomic_facts")
+        db_id = cursor.fetchone()[0]
+
+        resp = app_client.post("/memory/search", json={"query": "Alice bakery", "top_k": 1})
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        assert len(results) == 1
+        assert results[0]["id"] == db_id
+
+    def test_clear_wipes_temporal_graph(self, app_client, monkeypatch):
+        """DELETE /memory/clear removes all temporal graph nodes and edges."""
+        import memory_server
+
+        # Inject a temporal edge directly to simulate pre-existing history.
+        memory_server.temporal_graph.add_relationship(
+            "current-fact-id", "PRECEDED_BY", "past-fact-id",
+            subject_name="current fact", object_name="past fact",
+            fact_ids=["past-fact-id"], persist=False,
+        )
+        assert memory_server.temporal_graph.G.number_of_nodes() > 0
+
+        resp = app_client.delete("/memory/clear")
+        assert resp.status_code == 200
+        assert memory_server.temporal_graph.G.number_of_nodes() == 0
+        assert memory_server.temporal_graph.G.number_of_edges() == 0
+
+    def test_dead_predecessor_skipped_in_temporal_context(self, app_client, monkeypatch):
+        """
+        KNOWN LIMITATION (pinned): if the past-state node referenced in a PRECEDED_BY edge
+        no longer exists in SQLite (e.g., pruned by Phase 1 after the edge was written),
+        /memory/search silently skips it rather than raising an error.
+        temporal_context for that fact will be empty.
+        """
+        import uuid
+        import memory_server
+        from datetime import datetime
+
+        # Insert a current fact into SQLite + ChromaDB.
+        current_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "INSERT INTO atomic_facts (id, content, temporal_status, created_at, last_accessed) "
+            "VALUES (?, ?, 'current', ?, ?)",
+            (current_id, "Alice is a doctor.", now, now),
+        )
+        memory_server.sqlite_conn.commit()
+        memory_server.collection.add(
+            embeddings=[[0.1] * 768],
+            documents=["Alice is a doctor."],
+            ids=[current_id],
+        )
+
+        # The "past" fact ID does NOT exist in SQLite (simulates a pruned predecessor).
+        dead_past_id = str(uuid.uuid4())
+        memory_server.temporal_graph.add_relationship(
+            current_id, "PRECEDED_BY", dead_past_id,
+            subject_name="Alice is a doctor.",
+            object_name="Alice was a nurse.",
+            fact_ids=[dead_past_id], persist=False,
+        )
+
+        monkeypatch.setattr("memory_server.extract_entities_from_text", lambda q: None)
+        resp = app_client.post("/memory/search", json={"query": "Alice doctor", "top_k": 1})
+        assert resp.status_code == 200
+        body = resp.json()
+        # Dead predecessor is skipped: temporal_context must not contain the deleted fact.
+        tc = body["temporal_context"]
+        assert tc == [], \
+            "temporal_context should be empty when all predecessors are dead (not in SQLite)"
