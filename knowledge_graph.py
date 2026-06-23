@@ -52,7 +52,7 @@ class KnowledgeRelationshipGraph:
         if not self.G.has_node(node_id):
             return []
 
-        subgraph = nx.ego_graph(self.G, node_id, radius=depth, undirected=False)
+        subgraph = nx.ego_graph(self.G, node_id, radius=depth, undirected=True)
 
         facts = []
         for source, target, data in subgraph.edges(data=True):
