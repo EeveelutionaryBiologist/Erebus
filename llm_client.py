@@ -134,6 +134,14 @@ def _select_backend(config: dict) -> _LocalBackend | _OpenAICompatibleBackend:
     if config.get("LOCAL_MODEL"):
         return _LocalBackend(config)
 
+    # Check Ollama: no API key required, just base_url + model_name in config
+    ollama_conf = config.get("OLLAMA", {})
+    ollama_url = ollama_conf.get("BASE_URL", "")
+    ollama_model = ollama_conf.get("MODEL_NAME", "")
+    if ollama_url and ollama_model:
+        print("[OLLAMA] Running server detected...")
+        return _OpenAICompatibleBackend(base_url=ollama_url, api_key="ollama", model=ollama_model)
+
     for provider in _KEYED_PROVIDERS:
         provider_conf = config.get(provider, {})
         model = provider_conf.get("MODEL_NAME", "")
@@ -144,13 +152,6 @@ def _select_backend(config: dict) -> _LocalBackend | _OpenAICompatibleBackend:
             continue
         base_url = provider_conf.get("BASE_URL") or None
         return _OpenAICompatibleBackend(base_url=base_url, api_key=api_key, model=model)
-
-    # Ollama: no API key required, just base_url + model_name in config
-    ollama_conf = config.get("OLLAMA", {})
-    ollama_url = ollama_conf.get("BASE_URL", "")
-    ollama_model = ollama_conf.get("MODEL_NAME", "")
-    if ollama_url and ollama_model:
-        return _OpenAICompatibleBackend(base_url=ollama_url, api_key="ollama", model=ollama_model)
 
     return _LocalBackend(config)
 

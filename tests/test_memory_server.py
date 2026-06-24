@@ -1227,29 +1227,6 @@ class TestNormalization:
 # ---------------------------------------------------------------------------
 
 class TestContextMemory:
-    # -- Unit tests for the regex tokenizer (no server needed) --------------
-
-    def test_extract_candidates_single_words(self):
-        from memory_server import _extract_entity_candidates
-        result = _extract_entity_candidates("Alice owns a bakery")
-        assert "Alice" in result
-        assert "bakery" in result
-
-    def test_extract_candidates_bigrams(self):
-        from memory_server import _extract_entity_candidates
-        result = _extract_entity_candidates("Alice Smith owns a bakery")
-        assert "Alice Smith" in result
-
-    def test_extract_candidates_deduplicates(self):
-        from memory_server import _extract_entity_candidates
-        result = _extract_entity_candidates("alice alice")
-        assert result.count("alice") == 1
-
-    def test_extract_candidates_empty_string(self):
-        from memory_server import _extract_entity_candidates
-        assert _extract_entity_candidates("") == []
-
-    # -- Integration tests --------------------------------------------------
 
     def _seed(self, app_client, monkeypatch):
         monkeypatch.setattr(

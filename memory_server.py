@@ -458,6 +458,22 @@ class SearchQuery(BaseModel):
     query: str
     top_k: int = 3
 
+def _entity_appears_in_chunk(canonical: str, chunk_lower: str) -> bool:
+    """True if the canonical entity name is referenced (directly or by first name) in the chunk.
+
+    Matches in two directions:
+    - Forward: canonical name is a substring of chunk ("Jordan Kim" in "Jordan Kim smiled")
+    - Reverse token: any token of a multi-word canonical appears in chunk
+      ("Jordan" in "Jordan smiled" when canonical is "Jordan Kim")
+    The reverse check only fires for multi-word names to avoid spurious matches on
+    single common words.
+    """
+    if canonical.lower() in chunk_lower:
+        return True
+    tokens = canonical.lower().split()
+    return len(tokens) > 1 and any(tok in chunk_lower for tok in tokens)
+
+
 def _add_memory_sync(memory: MemoryInput, conn: sqlite3.Connection) -> dict:
     """Synchronous core of /memory/add. Called by the background task runner."""
     now = datetime.now().isoformat()
@@ -471,7 +487,7 @@ def _add_memory_sync(memory: MemoryInput, conn: sqlite3.Connection) -> dict:
     cursor.execute("SELECT canonical_name FROM entities")
     known_entities = [
         row[0] for row in cursor.fetchall()
-        if row[0].lower() in chunk_lower
+        if _entity_appears_in_chunk(row[0], chunk_lower)
     ]
     processed_data = (
         process_memory_chunk(memory.text, known_entities=known_entities)
@@ -767,25 +783,9 @@ def search_memory(search: SearchQuery):
         "temporal_context": temporal_context,
     }
 
-def _extract_entity_candidates(query: str) -> list[str]:
-    """Tokenizes a query into words and bigrams for entity lookup without the Librarian."""
-    words = re.findall(r"[a-zA-Z']+", query)
-    candidates = list(words)
-    for i in range(len(words) - 1):
-        candidates.append(f"{words[i]} {words[i + 1]}")
-    # Deduplicate case-insensitively while preserving first-occurrence order.
-    seen: set[str] = set()
-    result: list[str] = []
-    for c in candidates:
-        key = c.lower()
-        if key not in seen:
-            seen.add(key)
-            result.append(c)
-    return result
-
 @app.post("/memory/context")
 def context_memory(search: SearchQuery):
-    """Fast-path retrieval for Nyxx: vector search + regex-driven depth-1 graph lookup.
+    """Fast-path retrieval for Frontend: vector search + fact-anchored depth-1 graph lookup.
 
     No Librarian calls. Designed to stay well under 100ms on cached embeddings.
     Hit counts are updated so pruning reflects actual usage across both retrieval paths.
@@ -795,12 +795,16 @@ def context_memory(search: SearchQuery):
 
     # --- 1. VECTOR SEARCH ---
     query_vector = get_embedding(search.query)
+    # Over-fetch by 3× so the current-only filter has enough candidates to fill top_k.
+    # Historical/uncertain facts are silently dropped after the SQLite filter, so fetching
+    # exactly top_k from ChromaDB would leave fewer results than the caller requested.
     results = collection.query(
         query_embeddings=[query_vector],
-        n_results=search.top_k
+        n_results=min(search.top_k * 3, 50),
     )
 
     final_results = []
+    current_fact_ids: list[str] = []
     if results["ids"] and results["ids"][0]:
         for mem_id in results["ids"][0]:
             # Only surface current facts; historical facts remain in ChromaDB for temporal queries
@@ -817,13 +821,30 @@ def context_memory(search: SearchQuery):
             row = cursor.fetchone()
             if row:
                 final_results.append({"text": row[0], "hit_count": row[1]})
+                current_fact_ids.append(mem_id)
+    final_results = final_results[: search.top_k]
+    current_fact_ids = current_fact_ids[: search.top_k]
 
-    # --- 2. GRAPH RETRIEVAL (no Librarian — regex candidates only) ---
+    # --- 2. GRAPH RETRIEVAL (fact → chunk → entity linkage) ---
+    # Derive entity context from the facts that were actually retrieved rather than
+    # parsing the raw query string. This avoids regex fragility (possessives, punctuation)
+    # and keeps relational context grounded in the returned facts.
     relation_facts: list[str] = []
-    for candidate in _extract_entity_candidates(search.query):
-        entity_id = lookup_entity(candidate)
-        if not entity_id:
-            continue
+    entity_ids_seen: set[str] = set()
+    for fact_id in current_fact_ids:
+        cursor.execute(
+            "SELECT source_chunk_id FROM atomic_facts WHERE id = ?", (fact_id,)
+        )
+        chunk_row = cursor.fetchone()
+        if not chunk_row or not chunk_row[0]:
+            continue  # pre-migration fact with no chunk link
+        cursor.execute(
+            "SELECT entity_id FROM entity_chunks WHERE chunk_id = ?", (chunk_row[0],)
+        )
+        for r in cursor.fetchall():
+            entity_ids_seen.add(r[0])
+
+    for entity_id in entity_ids_seen:
         facts = knowledge_graph.retrieve_relationships(entity_id, depth=1)
         if facts:
             relation_facts.extend(facts)

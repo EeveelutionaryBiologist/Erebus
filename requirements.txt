@@ -8,3 +8,4 @@ numpy
 networkx
 openai
 pytest
+pyvis
