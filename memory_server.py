@@ -1,5 +1,6 @@
 import re
 import json
+import math
 import uuid
 import sqlite3
 import threading
@@ -27,6 +28,7 @@ from librarian import (
     librarian_check_supersession,
     librarian_check_concurrency,
     librarian_assign_groups,
+    librarian_resolve_compound_entity,
     ContextHint,
 )
 from knowledge_graph import KnowledgeRelationshipGraph
@@ -363,6 +365,15 @@ SUPERSESSION_KEYWORDS: frozenset[str] = frozenset([
 # Prevents O(n²) LLM calls when many historical facts share a valid_period.
 CONCURRENT_WITH_MAX_PAIRS = 50
 
+# Retrieval reranking weights (must sum to 1.0).
+# Similarity dominates; popularity rewards frequently-used facts; recency provides a
+# soft freshness preference. Historical/uncertain facts receive a score multiplier < 1.0
+# in /memory/search (not relevant in /memory/context, which hard-filters to current).
+RANK_WEIGHT_SIMILARITY = 0.70
+RANK_WEIGHT_POPULARITY = 0.20
+RANK_WEIGHT_RECENCY    = 0.10
+RECENCY_DECAY_DAYS     = 30   # half-life of the recency signal in days
+
 # ==========================================
 # 5. ASYNC TASK INFRASTRUCTURE
 # ==========================================
@@ -457,6 +468,37 @@ class MemoryInput(BaseModel):
 class SearchQuery(BaseModel):
     query: str
     top_k: int = 3
+
+class TemporalChainQuery(BaseModel):
+    fact_id: str | None = None
+    query: str | None = None
+    max_depth: int = 10
+
+def _retrieval_score(
+    distance: float,
+    hit_count: int,
+    last_accessed: str,
+    temporal_status: str,
+    now: datetime,
+) -> float:
+    """Composite relevance score for a retrieved fact.
+
+    Combines cosine similarity (dominant), log-scaled popularity, and exponential
+    recency decay.  For /memory/search, a status multiplier softly demotes
+    historical and uncertain facts relative to current ones.
+    """
+    similarity = 1.0 - distance / 2.0
+    popularity = min(math.log1p(hit_count) / math.log1p(100), 1.0)
+    days_stale = max((now - datetime.fromisoformat(last_accessed)).days, 0)
+    recency    = math.exp(-days_stale / RECENCY_DECAY_DAYS)
+    base = (
+        RANK_WEIGHT_SIMILARITY * similarity
+        + RANK_WEIGHT_POPULARITY * popularity
+        + RANK_WEIGHT_RECENCY * recency
+    )
+    multiplier = {"current": 1.0, "uncertain": 0.9, "historical": 0.75}.get(temporal_status, 1.0)
+    return base * multiplier
+
 
 def _entity_appears_in_chunk(canonical: str, chunk_lower: str) -> bool:
     """True if the canonical entity name is referenced (directly or by first name) in the chunk.
@@ -664,29 +706,41 @@ def search_memory(search: SearchQuery):
     cursor = sqlite_conn.cursor()
     
     # --- 1. VECTOR SEARCH ---
+    now_dt = datetime.fromisoformat(now)
     query_vector = get_embedding(search.query)
+    # Over-fetch 2× so reranking has meaningful material to work with.
     results = collection.query(
         query_embeddings=[query_vector],
-        n_results=search.top_k
+        n_results=min(search.top_k * 2, 30),
     )
-    
-    final_results = []
-    if results['ids'] and results['ids'][0]:
-        for mem_id in results['ids'][0]:
+
+    scored: list[tuple[float, dict]] = []
+    if results["ids"] and results["ids"][0]:
+        distances = results["distances"][0]
+        for mem_id, dist in zip(results["ids"][0], distances):
             cursor.execute(
                 "UPDATE atomic_facts SET hit_count = hit_count + 1, last_accessed = ? WHERE id = ?",
-                (now, mem_id)
+                (now, mem_id),
             )
             cursor.execute(
-                "SELECT content, hit_count, source_chunk_id FROM atomic_facts WHERE id = ?", (mem_id,)
+                "SELECT content, hit_count, source_chunk_id, temporal_status, last_accessed "
+                "FROM atomic_facts WHERE id = ?",
+                (mem_id,),
             )
             row = cursor.fetchone()
             if row:
-                final_results.append({
+                score = _retrieval_score(dist, row[1], row[4], row[3], now_dt)
+                scored.append((score, {
                     "id": mem_id,
-                    "text": row[0], "hit_count": row[1], "source_chunk_id": row[2],
-                })
+                    "text": row[0],
+                    "hit_count": row[1],
+                    "source_chunk_id": row[2],
+                    "temporal_status": row[3],
+                }))
     sqlite_conn.commit()
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    final_results = [item for _, item in scored[: search.top_k]]
 
     # --- 2. GRAPH RETRIEVAL ---
     relation_facts = []
@@ -794,19 +848,19 @@ def context_memory(search: SearchQuery):
     cursor = sqlite_conn.cursor()
 
     # --- 1. VECTOR SEARCH ---
+    now_dt = datetime.fromisoformat(now)
     query_vector = get_embedding(search.query)
-    # Over-fetch by 3× so the current-only filter has enough candidates to fill top_k.
-    # Historical/uncertain facts are silently dropped after the SQLite filter, so fetching
-    # exactly top_k from ChromaDB would leave fewer results than the caller requested.
+    # Over-fetch by 3× so the current-only filter has enough candidates to fill top_k,
+    # and reranking has meaningful material to work with.
     results = collection.query(
         query_embeddings=[query_vector],
         n_results=min(search.top_k * 3, 50),
     )
 
-    final_results = []
-    current_fact_ids: list[str] = []
+    scored: list[tuple[float, str, dict]] = []  # (score, mem_id, result_dict)
     if results["ids"] and results["ids"][0]:
-        for mem_id in results["ids"][0]:
+        distances = results["distances"][0]
+        for mem_id, dist in zip(results["ids"][0], distances):
             # Only surface current facts; historical facts remain in ChromaDB for temporal queries
             # but are excluded from the fast-path context window.
             cursor.execute(
@@ -815,15 +869,19 @@ def context_memory(search: SearchQuery):
                 (now, mem_id),
             )
             cursor.execute(
-                "SELECT content, hit_count FROM atomic_facts WHERE id = ? AND temporal_status = 'current'",
+                "SELECT content, hit_count, last_accessed "
+                "FROM atomic_facts WHERE id = ? AND temporal_status = 'current'",
                 (mem_id,),
             )
             row = cursor.fetchone()
             if row:
-                final_results.append({"text": row[0], "hit_count": row[1]})
-                current_fact_ids.append(mem_id)
-    final_results = final_results[: search.top_k]
-    current_fact_ids = current_fact_ids[: search.top_k]
+                score = _retrieval_score(dist, row[1], row[2], "current", now_dt)
+                scored.append((score, mem_id, {"text": row[0], "hit_count": row[1]}))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[: search.top_k]
+    final_results   = [item for _, _, item in top]
+    current_fact_ids = [mid  for _, mid, _  in top]
 
     # --- 2. GRAPH RETRIEVAL (fact → chunk → entity linkage) ---
     # Derive entity context from the facts that were actually retrieved rather than
@@ -995,7 +1053,7 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
     edges whose source list becomes empty. Legacy edges (no source_fact_ids) are left
     in place and cleaned up by the degree=0 orphan sweep at the end of each pass.
     """
-    report = {"pruned": 0, "merged": 0, "split": 0, "superseded": 0, "flagged": [], "errors": []}
+    report = {"pruned": 0, "merged": 0, "split": 0, "superseded": 0, "flagged": [], "errors": [], "resolved_entities": []}
     cursor = conn.cursor()
     now = datetime.now().isoformat()
 
@@ -1521,8 +1579,190 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
             temporal_graph.write_graph()
             print(f"[CONSOLIDATE] Removed {len(temp_orphaned)} orphaned temporal graph nodes.")
 
+    # ------------------------------------------------------------------
+    # Phase 5: Retroactive entity resolution (runs once, after all passes)
+    # Finds entity nodes whose canonical_name contains another entity's name
+    # as a substring, and rewrites them as proper KG triples.
+    # ------------------------------------------------------------------
+    print("[CONSOLIDATE] Phase 5: Retroactive entity resolution...")
+    cursor.execute(
+        "SELECT id, canonical_name FROM entities ORDER BY LENGTH(canonical_name) DESC"
+    )
+    all_entities: list[tuple[str, str]] = cursor.fetchall()
+    resolved_ids: set[str] = set()
+
+    for compound_id, compound_name in all_entities:
+        if compound_id in resolved_ids:
+            continue
+        for contained_id, contained_name in all_entities:
+            if compound_id == contained_id:
+                continue
+            if contained_id in resolved_ids:
+                continue
+            if len(compound_name) <= len(contained_name) + 3:
+                continue
+            if contained_name.lower() not in compound_name.lower():
+                continue
+            decision = librarian_resolve_compound_entity(compound_name, contained_name)
+            if decision is None or decision.action == "keep":
+                continue
+            if decision.action == "flag":
+                report["flagged"].append({
+                    "compound": compound_name,
+                    "contained": contained_name,
+                    "source": "phase5",
+                })
+                continue
+            # action == "rewrite": rewrite compound → new_pred → contained
+            new_pred = normalize_predicate(decision.suggested_predicate or "IS_RELATED_TO")
+            if knowledge_graph.G.has_node(compound_id):
+                # Rewrite all in-edges: X --PRED--> compound becomes X --new_pred--> contained
+                for subj_id, _, key, edge_data in list(
+                    knowledge_graph.G.in_edges(compound_id, data=True, keys=True)
+                ):
+                    subj_name = knowledge_graph.G.nodes[subj_id].get("name", subj_id)
+                    knowledge_graph.add_relationship(
+                        subj_id, new_pred, contained_id,
+                        subject_name=subj_name,
+                        object_name=contained_name,
+                        fact_ids=edge_data.get("source_fact_ids") or None,
+                        persist=False,
+                    )
+                # Transfer out-edges: compound --PRED--> X becomes contained --PRED--> X
+                for _, obj_id, key, edge_data in list(
+                    knowledge_graph.G.out_edges(compound_id, data=True, keys=True)
+                ):
+                    if obj_id == compound_id:
+                        continue
+                    obj_name = knowledge_graph.G.nodes[obj_id].get("name", obj_id)
+                    knowledge_graph.add_relationship(
+                        contained_id, edge_data.get("relation", "IS_RELATED_TO"), obj_id,
+                        subject_name=contained_name,
+                        object_name=obj_name,
+                        fact_ids=edge_data.get("source_fact_ids") or None,
+                        persist=False,
+                    )
+                knowledge_graph.remove_entity_node(compound_id, persist=False)
+            # Transfer entity_chunks
+            cursor.execute(
+                "INSERT OR IGNORE INTO entity_chunks (entity_id, chunk_id) "
+                "SELECT ?, chunk_id FROM entity_chunks WHERE entity_id = ?",
+                (contained_id, compound_id),
+            )
+            cursor.execute("DELETE FROM entity_chunks WHERE entity_id = ?", (compound_id,))
+            # Transfer entity_groups
+            cursor.execute(
+                "INSERT OR IGNORE INTO entity_groups (entity_id, group_id) "
+                "SELECT ?, group_id FROM entity_groups WHERE entity_id = ?",
+                (contained_id, compound_id),
+            )
+            cursor.execute("DELETE FROM entity_groups WHERE entity_id = ?", (compound_id,))
+            cursor.execute("DELETE FROM entities WHERE id = ?", (compound_id,))
+            resolved_ids.add(compound_id)
+            report["resolved_entities"].append({
+                "compound": compound_name,
+                "contained": contained_name,
+                "predicate": new_pred,
+            })
+            print(
+                f"[CONSOLIDATE] Phase 5: Resolved '{compound_name}'"
+                f" → '{new_pred}' → '{contained_name}'"
+            )
+            break  # one compound resolves to one contained entity per run
+
+    if resolved_ids:
+        knowledge_graph.write_graph()
+        conn.commit()
+
     print(f"[CONSOLIDATE] Done. {report}")
     return {"status": "success", "report": report}
+
+
+@app.post("/memory/temporal/chain")
+def temporal_chain(req: TemporalChainQuery):
+    """Ordered PRECEDED_BY predecessor chain for a fact.
+
+    Provide fact_id for a direct lookup, or query for a ChromaDB top-1 lookup that
+    prefers current facts. Each chain entry is hop-indexed (BFS order) and includes
+    any CONCURRENT_WITH facts for that historical state.
+    """
+    if req.fact_id is None and req.query is None:
+        raise HTTPException(status_code=422, detail="Provide fact_id or query.")
+
+    cursor = sqlite_conn.cursor()
+
+    # --- Resolve root fact_id ---
+    root_id = req.fact_id
+    if root_id is None:
+        query_vec = get_embedding(req.query)
+        results = collection.query(
+            query_embeddings=[query_vec],
+            n_results=min(req.max_depth * 3, 15),
+        )
+        root_id = None
+        if results["ids"] and results["ids"][0]:
+            for candidate_id in results["ids"][0]:
+                cursor.execute(
+                    "SELECT temporal_status FROM atomic_facts WHERE id = ?", (candidate_id,)
+                )
+                row = cursor.fetchone()
+                if row and row[0] == "current":
+                    root_id = candidate_id
+                    break
+            if root_id is None:
+                root_id = results["ids"][0][0]
+        if root_id is None:
+            raise HTTPException(status_code=404, detail="No fact found for query.")
+
+    # --- Fetch root fact metadata ---
+    cursor.execute(
+        "SELECT content, temporal_status, valid_period FROM atomic_facts WHERE id = ?",
+        (root_id,),
+    )
+    root_row = cursor.fetchone()
+    if not root_row:
+        raise HTTPException(status_code=404, detail=f"fact_id '{root_id}' not found.")
+
+    root_fact = {
+        "id": root_id,
+        "text": root_row[0],
+        "temporal_status": root_row[1],
+        "valid_period": root_row[2],
+    }
+
+    # --- Traverse PRECEDED_BY chain (BFS, ordered by hop) ---
+    chain: list[dict] = []
+    for entry in temporal_graph.retrieve_predecessor_chain(root_id, max_depth=req.max_depth):
+        pred_id = entry["fact_id"]
+        cursor.execute(
+            "SELECT content, temporal_status, valid_period FROM atomic_facts WHERE id = ?",
+            (pred_id,),
+        )
+        pred_row = cursor.fetchone()
+        if not pred_row:
+            continue  # silently skip facts deleted by a later consolidation pass
+        concurrent_with: list[dict] = []
+        for conc_id in temporal_graph.get_concurrent_with(pred_id):
+            cursor.execute(
+                "SELECT content, valid_period FROM atomic_facts WHERE id = ?", (conc_id,)
+            )
+            conc_row = cursor.fetchone()
+            if conc_row:
+                concurrent_with.append({
+                    "fact_id": conc_id,
+                    "text": conc_row[0],
+                    "valid_period": conc_row[1],
+                })
+        chain.append({
+            "hop": entry["depth"],
+            "fact_id": pred_id,
+            "text": pred_row[0],
+            "temporal_status": pred_row[1],
+            "valid_period": pred_row[2],
+            "concurrent_with": concurrent_with,
+        })
+
+    return {"root_fact": root_fact, "chain": chain}
 
 
 @app.post("/memory/consolidate", status_code=202)
