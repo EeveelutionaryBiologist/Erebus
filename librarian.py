@@ -85,6 +85,14 @@ class GroupAssignment(BaseModel):
         description="Name of a new group to create, or null if an existing group covers it or no group is warranted."
     )
 
+class CompoundEntityDecision(BaseModel):
+    action: Literal["rewrite", "keep", "flag"]
+    suggested_predicate: str | None = Field(
+        default=None,
+        description="UPPERCASE_SNAKE_CASE predicate to use when action is 'rewrite' (e.g. 'IS_ADVISOR_TO')."
+    )
+    explanation: str = Field(default="", description="Brief explanation of the decision.")
+
 class ContextHint(BaseModel):
     subject: str | None = Field(
         default=None,
@@ -328,6 +336,50 @@ def librarian_assign_groups(entity_name: str, existing_groups: list[str]) -> Gro
         return GroupAssignment(**json.loads(output_str))
     except Exception as e:
         print(f"[LIBRARIAN ERROR] Group assignment failed: {e}")
+        return None
+
+
+def librarian_resolve_compound_entity(compound_name: str, contained_name: str) -> CompoundEntityDecision | None:
+    """Decides whether a compound entity name encodes a predicate + contained-entity relationship.
+
+    E.g., 'Advisor To Cellbridge Therapeutics' with contained 'Cellbridge Therapeutics'
+    should be rewritten as the triple (subject, IS_ADVISOR_TO, Cellbridge Therapeutics).
+    Called by Phase 5 of consolidation for each candidate compound/contained entity pair.
+    """
+    system_prompt = (
+        "You are a knowledge graph normalizer. You have two entity names:\n"
+        "1. A 'compound' name that may describe a role or relationship "
+        "(e.g., 'Advisor To Cellbridge Therapeutics')\n"
+        "2. A 'contained' name that appears as a substring (e.g., 'Cellbridge Therapeutics')\n\n"
+        "Decide what to do:\n"
+        "- 'rewrite': The compound encodes a predicate. Replace it with a proper triple "
+        "(some subject, suggested_predicate, contained entity). Provide suggested_predicate as "
+        "UPPERCASE_SNAKE_CASE (e.g., 'IS_ADVISOR_TO', 'WORKS_AT', 'MEMBER_OF').\n"
+        "- 'keep': The compound is a legitimately distinct entity "
+        "(e.g., 'Alice Kim' containing 'Alice' — two different people).\n"
+        "- 'flag': Genuinely ambiguous — neither clearly a predicate nor a distinct entity.\n\n"
+        "Choose 'keep' for full human names where the contained name is just a first or last name. "
+        "Choose 'rewrite' when the compound prepends a role description to the contained entity. "
+        "When in doubt, choose 'keep' to avoid data loss."
+    )
+    try:
+        output_str = get_llm_client().chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        f'Compound entity: "{compound_name}"\n'
+                        f'Contained entity: "{contained_name}"'
+                    ),
+                },
+            ],
+            schema=CompoundEntityDecision.model_json_schema(),
+            temperature=0.1,
+        )
+        return CompoundEntityDecision(**json.loads(output_str))
+    except Exception as e:
+        print(f"[LIBRARIAN ERROR] Compound entity resolution failed: {e}")
         return None
 
 

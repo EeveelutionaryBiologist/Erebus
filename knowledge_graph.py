@@ -1,5 +1,6 @@
 
 import json
+from collections import deque
 from pathlib import Path
 import networkx as nx
 from networkx.readwrite import json_graph
@@ -224,6 +225,63 @@ class KnowledgeRelationshipGraph:
                     self._fact_edge_index.pop(fid, None)
         self.G.remove_node(node_id)
         self.write_graph()
+
+    def remove_entity_node(self, node_id: str, persist: bool = True) -> None:
+        """Remove an entity node, cleaning _fact_edge_index for all its incident edges.
+
+        Mirrors remove_fact_node() but operates on entity-layer nodes (knowledge_graph)
+        rather than temporal-state nodes (temporal_graph). Use persist=False inside a
+        batch loop and call write_graph() once at the end.
+        """
+        if not self.G.has_node(node_id):
+            return
+        all_incident = (
+            list(self.G.out_edges(node_id, data=True, keys=True))
+            + list(self.G.in_edges(node_id, data=True, keys=True))
+        )
+        for subj, obj, key, data in all_incident:
+            for fid in list(data.get("source_fact_ids", [])):
+                entries = self._fact_edge_index.get(fid, [])
+                updated = [e for e in entries if e != (subj, obj, key)]
+                if updated:
+                    self._fact_edge_index[fid] = updated
+                else:
+                    self._fact_edge_index.pop(fid, None)
+        self.G.remove_node(node_id)
+        if persist:
+            self.write_graph()
+
+    def retrieve_predecessor_chain(self, fact_id: str, max_depth: int = 10) -> list[dict]:
+        """BFS traversal following only PRECEDED_BY edges from fact_id.
+
+        Returns list of {fact_id: str, depth: int} ordered by hop distance.
+        CONCURRENT_WITH edges are never followed — use get_concurrent_with() per hop.
+        """
+        if not self.G.has_node(fact_id):
+            return []
+        result: list[dict] = []
+        queue: deque[tuple[str, int]] = deque([(fact_id, 0)])
+        visited: set[str] = {fact_id}
+        while queue:
+            node, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+            for _, succ, edge_data in self.G.out_edges(node, data=True):
+                if edge_data.get("relation") == "PRECEDED_BY" and succ not in visited:
+                    visited.add(succ)
+                    result.append({"fact_id": succ, "depth": depth + 1})
+                    queue.append((succ, depth + 1))
+        return result
+
+    def get_concurrent_with(self, fact_id: str) -> list[str]:
+        """Returns fact_ids of all CONCURRENT_WITH neighbors of fact_id."""
+        if not self.G.has_node(fact_id):
+            return []
+        return [
+            succ
+            for _, succ, edge_data in self.G.out_edges(fact_id, data=True)
+            if edge_data.get("relation") == "CONCURRENT_WITH"
+        ]
 
     def clear(self):
         """Wipes all nodes, edges, and the fact index, then persists the empty graph."""
