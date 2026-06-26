@@ -80,6 +80,7 @@ def startup_event():
     _migrate_to_v2()
     _migrate_to_v3()
     _migrate_to_v4()
+    _migrate_to_v5()
 
 def get_embedding(text: str) -> list[float]:
     response = embedder.create_embedding(text)
@@ -252,6 +253,24 @@ def _migrate_to_v4():
     """)
     sqlite_conn.commit()
 
+def _migrate_to_v5():
+    """Backfills word-token aliases for existing entities that have empty aliases."""
+    cursor = sqlite_conn.cursor()
+    cursor.execute("SELECT id, canonical_name FROM entities WHERE aliases = '[]' OR aliases IS NULL")
+    rows = cursor.fetchall()
+    updated = 0
+    for entity_id, canonical_name in rows:
+        aliases = _compute_aliases(canonical_name)
+        if aliases:
+            cursor.execute(
+                "UPDATE entities SET aliases = ? WHERE id = ?",
+                (json.dumps(aliases), entity_id),
+            )
+            updated += 1
+    sqlite_conn.commit()
+    if updated:
+        print(f"[SYSTEM] v5 migration: backfilled aliases for {updated} entities.")
+
 # ---------------------------------------------------------------------------
 # Write-time normalization
 # ---------------------------------------------------------------------------
@@ -265,6 +284,22 @@ _PREDICATE_SYNONYMS: dict[str, str] = {
     "IS_AN":     "IS",
     "WORKS_FOR": "WORKS_AT",
 }
+
+_ALIAS_STOPWORDS = frozenset({
+    "a", "an", "the", "of", "to", "for", "and", "or", "in", "at", "by", "with", "from",
+})
+
+def _compute_aliases(canonical_name: str) -> list[str]:
+    """Word-token aliases for a multi-word entity name used by tiered entity lookup.
+
+    Single-word names return an empty list (the canonical name itself is the only token).
+    Common prepositions and articles are excluded so 'University of California' aliases to
+    ['University', 'California'] rather than including 'of'.
+    """
+    tokens = canonical_name.strip().split()
+    if len(tokens) <= 1:
+        return []
+    return [t for t in tokens if len(t) >= 2 and t.lower() not in _ALIAS_STOPWORDS]
 
 def normalize_entity_name(name: str) -> str:
     """Title-cases an entity name so 'hailey' and 'HAILEY' both become 'Hailey'."""
@@ -287,10 +322,11 @@ def get_or_create_entity(name: str, conn: sqlite3.Connection | None = None) -> s
         return row[0]
     entity_id = str(uuid.uuid4())
     now = datetime.now().isoformat()
+    aliases = json.dumps(_compute_aliases(name))
     cursor.execute(
         "INSERT INTO entities (id, canonical_name, aliases, hit_count, created_at, last_accessed) "
-        "VALUES (?, ?, '[]', 0, ?, ?)",
-        (entity_id, name, now, now)
+        "VALUES (?, ?, ?, 0, ?, ?)",
+        (entity_id, name, aliases, now, now)
     )
     c.commit()
     return entity_id
@@ -312,12 +348,56 @@ def get_or_create_group(name: str, conn: sqlite3.Connection | None = None) -> st
     c.commit()
     return group_id
 
-def lookup_entity(name: str) -> str | None:
-    """Returns the entity UUID for `name` (case-insensitive), or None if not found."""
+def lookup_entity_ids(name: str) -> list[str]:
+    """Returns entity UUIDs matching `name` via tiered SQL matching.
+
+    Tier 1 — exact case-insensitive canonical name: returns immediately on a single hit.
+    Tier 2 — word-boundary prefix/suffix: 'Alice' matches 'Alice Mercer' or 'Mercer Alice'.
+    Tier 3 — alias table lookup via json_each: catches middle tokens and pre-computed aliases.
+
+    Returning multiple IDs on ambiguous partial names (e.g. 'Alice' matching both 'Alice
+    Mercer' and 'Alice Kim') is intentional — KG traversal from multiple starting nodes
+    produces richer, additive context rather than incorrect context.
+    """
     cursor = sqlite_conn.cursor()
-    cursor.execute("SELECT id FROM entities WHERE LOWER(canonical_name) = LOWER(?)", (name,))
+    name_lower = name.strip().lower()
+
+    # Tier 1: exact
+    cursor.execute("SELECT id FROM entities WHERE LOWER(canonical_name) = ?", (name_lower,))
     row = cursor.fetchone()
-    return row[0] if row else None
+    if row:
+        return [row[0]]
+
+    # Tier 2: name is a word-boundary prefix or suffix of canonical_name
+    cursor.execute(
+        "SELECT id FROM entities "
+        "WHERE LOWER(canonical_name) LIKE ? OR LOWER(canonical_name) LIKE ?",
+        (name_lower + " %", "% " + name_lower),
+    )
+    seen: set[str] = set()
+    results: list[str] = []
+    for r in cursor.fetchall():
+        if r[0] not in seen:
+            seen.add(r[0])
+            results.append(r[0])
+
+    # Tier 3: alias match via json_each (catches middle tokens not found by prefix/suffix)
+    cursor.execute(
+        "SELECT DISTINCT e.id FROM entities e, json_each(e.aliases) a WHERE LOWER(a.value) = ?",
+        (name_lower,),
+    )
+    for r in cursor.fetchall():
+        if r[0] not in seen:
+            seen.add(r[0])
+            results.append(r[0])
+
+    return results
+
+
+def lookup_entity(name: str) -> str | None:
+    """Returns the first matching entity UUID for `name`, or None. Single-result convenience wrapper."""
+    ids = lookup_entity_ids(name)
+    return ids[0] if ids else None
 
 # ==========================================
 # 4. CONSOLIDATION CONFIGURATION
@@ -327,7 +407,7 @@ PRUNE_AGE_DAYS = 60
 
 # Cosine similarity threshold above which two facts are sent to the Librarian
 # for a merge decision. Range: 0.0–1.0. Higher = more conservative.
-DEDUP_SIMILARITY_THRESHOLD = 0.90
+DEDUP_SIMILARITY_THRESHOLD = 0.85
 
 # Above this threshold the facts are considered near-identical text; the Librarian
 # is skipped and the lower-hit-count copy is dropped directly.
@@ -748,31 +828,33 @@ def search_memory(search: SearchQuery):
     extracted = extract_entities_from_text(search.query)
 
     if extracted and hasattr(extracted, 'entities'):
+        seen_entity_ids: set[str] = set()
         for entity in extracted.entities:
-            entity_id = lookup_entity(entity.name)
-            if not entity_id:
-                continue
-            facts = knowledge_graph.retrieve_relationships(entity_id, depth=1)
-            if facts:
-                relation_facts.extend(facts)
-                cursor.execute(
-                    "UPDATE entities SET hit_count = hit_count + 1, last_accessed = ? WHERE id = ?",
-                    (now, entity_id)
-                )
-            cursor.execute("""
-                SELECT g.name FROM entity_groups eg
-                JOIN groups g ON eg.group_id = g.id
-                WHERE eg.entity_id = ?
-                ORDER BY g.name
-            """, (entity_id,))
-            groups = [r[0] for r in cursor.fetchall()]
-            if groups:
-                cursor.execute(
-                    "SELECT canonical_name FROM entities WHERE id = ?", (entity_id,)
-                )
-                name_row = cursor.fetchone()
-                if name_row:
-                    entity_groups_found[name_row[0]] = groups
+            for entity_id in lookup_entity_ids(entity.name):
+                if entity_id in seen_entity_ids:
+                    continue
+                seen_entity_ids.add(entity_id)
+                facts = knowledge_graph.retrieve_relationships(entity_id, depth=1)
+                if facts:
+                    relation_facts.extend(facts)
+                    cursor.execute(
+                        "UPDATE entities SET hit_count = hit_count + 1, last_accessed = ? WHERE id = ?",
+                        (now, entity_id)
+                    )
+                cursor.execute("""
+                    SELECT g.name FROM entity_groups eg
+                    JOIN groups g ON eg.group_id = g.id
+                    WHERE eg.entity_id = ?
+                    ORDER BY g.name
+                """, (entity_id,))
+                groups = [r[0] for r in cursor.fetchall()]
+                if groups:
+                    cursor.execute(
+                        "SELECT canonical_name FROM entities WHERE id = ?", (entity_id,)
+                    )
+                    name_row = cursor.fetchone()
+                    if name_row:
+                        entity_groups_found[name_row[0]] = groups
     sqlite_conn.commit()
 
     summarized_context = ""

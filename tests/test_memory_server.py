@@ -22,8 +22,10 @@ Librarian returns. Patch at the memory_server level, e.g.:
 """
 
 import pytest
+from datetime import datetime
 from librarian import (
     AtomicFact,
+    CompoundEntityDecision,
     ContextHint,
     ConcurrencyDecision,
     EntityExtraction,
@@ -1223,6 +1225,127 @@ class TestNormalization:
 
 
 # ---------------------------------------------------------------------------
+# Entity lookup — tiered matching + alias population
+# ---------------------------------------------------------------------------
+
+class TestEntityLookup:
+    """Unit and integration tests for lookup_entity_ids() and alias backfill."""
+
+    def test_compute_aliases_multi_word(self):
+        from memory_server import _compute_aliases
+        assert _compute_aliases("Alice Mercer") == ["Alice", "Mercer"]
+
+    def test_compute_aliases_single_word_empty(self):
+        from memory_server import _compute_aliases
+        assert _compute_aliases("Alice") == []
+
+    def test_compute_aliases_strips_stopwords(self):
+        from memory_server import _compute_aliases
+        result = _compute_aliases("University Of California")
+        assert "Of" not in result
+        assert "University" in result
+        assert "California" in result
+
+    def test_get_or_create_entity_populates_aliases(self, app_client):
+        import memory_server
+        import json
+        entity_id = memory_server.get_or_create_entity("Alice Mercer")
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT aliases FROM entities WHERE id = ?", (entity_id,))
+        row = cursor.fetchone()
+        aliases = json.loads(row[0])
+        assert "Alice" in aliases
+        assert "Mercer" in aliases
+
+    def test_lookup_entity_ids_exact_match(self, app_client):
+        import memory_server
+        memory_server.get_or_create_entity("Alice Mercer")
+        ids = memory_server.lookup_entity_ids("Alice Mercer")
+        assert len(ids) == 1
+
+    def test_lookup_entity_ids_prefix_match(self, app_client):
+        import memory_server
+        memory_server.get_or_create_entity("Alice Mercer")
+        ids = memory_server.lookup_entity_ids("Alice")
+        assert len(ids) == 1
+
+    def test_lookup_entity_ids_suffix_match(self, app_client):
+        import memory_server
+        memory_server.get_or_create_entity("Alice Mercer")
+        ids = memory_server.lookup_entity_ids("Mercer")
+        assert len(ids) == 1
+
+    def test_lookup_entity_ids_alias_match(self, app_client):
+        """Middle token not reachable by prefix/suffix is found via alias json_each."""
+        import memory_server
+        memory_server.get_or_create_entity("Big Alice Corp")
+        ids = memory_server.lookup_entity_ids("Alice")
+        assert len(ids) == 1
+
+    def test_lookup_entity_ids_case_insensitive(self, app_client):
+        import memory_server
+        memory_server.get_or_create_entity("Alice Mercer")
+        assert len(memory_server.lookup_entity_ids("alice")) == 1
+        assert len(memory_server.lookup_entity_ids("ALICE")) == 1
+
+    def test_lookup_entity_ids_multiple_matches(self, app_client):
+        """Ambiguous first name returns all matching entities."""
+        import memory_server
+        memory_server.get_or_create_entity("Alice Mercer")
+        memory_server.get_or_create_entity("Alice Kim")
+        ids = memory_server.lookup_entity_ids("Alice")
+        assert len(ids) == 2
+
+    def test_lookup_entity_ids_no_match(self, app_client):
+        import memory_server
+        ids = memory_server.lookup_entity_ids("Zephyrine Nonexistent")
+        assert ids == []
+
+    def test_search_graph_lookup_resolves_partial_name(self, app_client, monkeypatch):
+        """Search with first-name-only LLM extraction still returns relational context."""
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["Alice Mercer owns a bakery."],
+                triples=[KnowledgeTriple(subject="Alice Mercer", predicate="OWNS", object="Bakery")],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "Alice Mercer owns a bakery."})
+
+        # LLM extracts only "Alice" — old code returned no relational context
+        monkeypatch.setattr(
+            "memory_server.extract_entities_from_text",
+            lambda text: EntityExtraction(entities=[Entity(name="Alice")]),
+        )
+        resp = app_client.post("/memory/search", json={"query": "What does Alice own?", "top_k": 3})
+        assert resp.status_code == 200
+        assert "Alice Mercer" in resp.json()["relational_context"]
+
+    def test_migrate_v5_backfills_existing_entities(self, app_client):
+        """_migrate_to_v5 fills aliases='[]' rows without touching already-populated ones."""
+        import memory_server
+        import json
+        # Manually insert an entity with empty aliases (simulates pre-v5 data)
+        import uuid
+        eid = str(uuid.uuid4())
+        now = "2024-01-01T00:00:00"
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "INSERT INTO entities (id, canonical_name, aliases, hit_count, created_at, last_accessed) "
+            "VALUES (?, ?, '[]', 0, ?, ?)",
+            (eid, "Jordan Kim", now, now),
+        )
+        memory_server.sqlite_conn.commit()
+
+        memory_server._migrate_to_v5()
+
+        cursor.execute("SELECT aliases FROM entities WHERE id = ?", (eid,))
+        aliases = json.loads(cursor.fetchone()[0])
+        assert "Jordan" in aliases
+        assert "Kim" in aliases
+
+
+# ---------------------------------------------------------------------------
 # POST /memory/context
 # ---------------------------------------------------------------------------
 
@@ -1298,6 +1421,65 @@ class TestContextMemory:
         assert resp.status_code == 200
         body = resp.json()
         assert body["results"] == []
+
+
+# ---------------------------------------------------------------------------
+# _retrieval_score  (pure function, no server needed)
+# ---------------------------------------------------------------------------
+
+class TestRetrievalScore:
+    """Unit tests for the multi-signal retrieval scoring function."""
+
+    NOW = datetime(2025, 6, 1, 12, 0, 0)
+    RECENT = "2025-06-01T11:00:00"   # accessed 1 hour ago
+    STALE   = "2025-01-01T00:00:00"  # accessed ~5 months ago
+
+    @staticmethod
+    def score(**kwargs):
+        import memory_server
+        defaults = dict(
+            distance=0.2,
+            hit_count=0,
+            last_accessed=TestRetrievalScore.RECENT,
+            temporal_status="current",
+            now=TestRetrievalScore.NOW,
+        )
+        defaults.update(kwargs)
+        return memory_server._retrieval_score(**defaults)
+
+    def test_lower_distance_scores_higher(self):
+        assert self.score(distance=0.0) > self.score(distance=0.5)
+
+    def test_higher_hit_count_scores_higher(self):
+        assert self.score(hit_count=50) > self.score(hit_count=0)
+
+    def test_recent_scores_higher_than_stale(self):
+        assert self.score(last_accessed=self.RECENT) > self.score(last_accessed=self.STALE)
+
+    def test_historical_scores_lower_than_current(self):
+        assert self.score(temporal_status="current") > self.score(temporal_status="historical")
+
+    def test_uncertain_between_current_and_historical(self):
+        assert (
+            self.score(temporal_status="current")
+            > self.score(temporal_status="uncertain")
+            > self.score(temporal_status="historical")
+        )
+
+    def test_score_bounded_above_one(self):
+        # Perfect similarity, max popularity, fully recent — still ≤ 1.0
+        s = self.score(distance=0.0, hit_count=100, last_accessed=self.RECENT)
+        assert s <= 1.0
+
+    def test_score_non_negative(self):
+        s = self.score(distance=2.0, hit_count=0, last_accessed=self.STALE, temporal_status="historical")
+        assert s >= 0.0
+
+    def test_popularity_can_overcome_small_similarity_gap(self):
+        # A fact with 50 hits but slightly worse similarity should beat a cold fact.
+        popular = self.score(distance=0.4, hit_count=50)
+        cold    = self.score(distance=0.3, hit_count=0)
+        assert popular > cold
 
 
 # ---------------------------------------------------------------------------
@@ -2129,3 +2311,397 @@ class TestTemporalGraph:
         ]
         assert len(cw_edges) >= 1, \
             "past_id must still have its CONCURRENT_WITH edge to concurrent_id"
+
+
+# ---------------------------------------------------------------------------
+# POST /memory/consolidate — Phase 5: Retroactive Entity Resolution
+# ---------------------------------------------------------------------------
+
+class TestConsolidatePhase5:
+    """Tests for Phase 5 retroactive entity resolution in _consolidate_memories_sync."""
+
+    def _stub_all_other_phases(self, monkeypatch):
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+        monkeypatch.setattr("memory_server.librarian_check_supersession", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_check_concurrency", lambda a, b, pa, pb: None)
+
+    def test_phase5_rewrites_compound_entity(self, app_client, monkeypatch):
+        """Phase 5 rewrites a compound entity node as a proper KG triple."""
+        import memory_server
+        import uuid as _uuid
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["James is a senior advisor to Cellbridge Therapeutics."],
+                triples=[
+                    KnowledgeTriple(
+                        subject="James",
+                        predicate="IS",
+                        object="Advisor To Cellbridge Therapeutics",
+                    )
+                ],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "first"})
+
+        cursor = memory_server.sqlite_conn.cursor()
+
+        cursor.execute(
+            "SELECT id FROM entities WHERE LOWER(canonical_name) = LOWER(?)",
+            ("Advisor To Cellbridge Therapeutics",),
+        )
+        compound_row = cursor.fetchone()
+        assert compound_row, "compound entity should exist after /add"
+        compound_id = compound_row[0]
+
+        # Insert "Cellbridge Therapeutics" as a separate entity so Phase 5 has a target.
+        cursor.execute(
+            "SELECT id FROM entities WHERE LOWER(canonical_name) = LOWER(?)",
+            ("Cellbridge Therapeutics",),
+        )
+        contained_row = cursor.fetchone()
+        if not contained_row:
+            contained_id = str(_uuid.uuid4())
+            now = datetime.now().isoformat()
+            cursor.execute(
+                "INSERT INTO entities (id, canonical_name, aliases, hit_count, created_at, last_accessed) "
+                "VALUES (?, 'Cellbridge Therapeutics', '[]', 0, ?, ?)",
+                (contained_id, now, now),
+            )
+            memory_server.sqlite_conn.commit()
+        else:
+            contained_id = contained_row[0]
+
+        monkeypatch.setattr(
+            "memory_server.librarian_resolve_compound_entity",
+            lambda compound, contained: CompoundEntityDecision(
+                action="rewrite", suggested_predicate="IS_ADVISOR_TO"
+            ),
+        )
+        self._stub_all_other_phases(monkeypatch)
+        app_client.post("/memory/consolidate")
+
+        # Compound entity should be gone from SQLite.
+        cursor.execute("SELECT id FROM entities WHERE id = ?", (compound_id,))
+        assert cursor.fetchone() is None, "compound entity should be deleted from SQLite"
+
+        # New KG edge James --IS_ADVISOR_TO--> Cellbridge Therapeutics should exist.
+        kg = memory_server.knowledge_graph
+        james_row = cursor.execute(
+            "SELECT id FROM entities WHERE LOWER(canonical_name) = LOWER(?)", ("James",)
+        ).fetchone()
+        assert james_row, "James entity should still exist"
+        james_id = james_row[0]
+        assert kg.G.has_node(james_id), "James should still be a KG node"
+        assert kg.G.has_node(contained_id), "Cellbridge Therapeutics should be a KG node"
+        edges = [
+            data for _, _, data in kg.G.out_edges(james_id, data=True)
+            if data.get("relation") == "IS_ADVISOR_TO"
+        ]
+        assert edges, "James --[IS_ADVISOR_TO]--> Cellbridge Therapeutics edge should exist"
+
+    def test_phase5_keeps_distinct_entities(self, app_client, monkeypatch):
+        """Phase 5 leaves both entities intact when Librarian returns action='keep'."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary(text):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=["Alice Kim is a researcher."],
+                    triples=[KnowledgeTriple(subject="Alice Kim", predicate="IS", object="Researcher")],
+                )
+            return MemoryProcessing(
+                atomic_facts=["Alice is a friend."],
+                triples=[KnowledgeTriple(subject="Alice", predicate="IS", object="Friend")],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr(
+            "memory_server.librarian_resolve_compound_entity",
+            lambda compound, contained: CompoundEntityDecision(action="keep"),
+        )
+        self._stub_all_other_phases(monkeypatch)
+        app_client.post("/memory/consolidate")
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM entities WHERE LOWER(canonical_name) IN ('alice kim', 'alice')"
+        )
+        assert cursor.fetchone()[0] == 2, "both entities should survive when action='keep'"
+
+    def test_phase5_flags_ambiguous_pair(self, app_client, monkeypatch):
+        """Phase 5 adds flagged entry with source='phase5' when action='flag'."""
+        import memory_server
+        import uuid as _uuid
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["James works for Cellbridge Therapeutics."],
+                triples=[
+                    KnowledgeTriple(
+                        subject="James",
+                        predicate="IS",
+                        object="Advisor To Cellbridge Therapeutics",
+                    )
+                ],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "first"})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        contained_id = str(_uuid.uuid4())
+        now = datetime.now().isoformat()
+        cursor.execute(
+            "INSERT OR IGNORE INTO entities "
+            "(id, canonical_name, aliases, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Cellbridge Therapeutics', '[]', 0, ?, ?)",
+            (contained_id, now, now),
+        )
+        memory_server.sqlite_conn.commit()
+
+        monkeypatch.setattr(
+            "memory_server.librarian_resolve_compound_entity",
+            lambda compound, contained: CompoundEntityDecision(action="flag"),
+        )
+        self._stub_all_other_phases(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        report = task["result"]["report"]
+
+        phase5_flags = [f for f in report["flagged"] if f.get("source") == "phase5"]
+        assert phase5_flags, "report['flagged'] should contain at least one phase5 entry"
+
+    def test_phase5_transfers_entity_chunks(self, app_client, monkeypatch):
+        """Phase 5 migrates entity_chunks from compound to contained entity."""
+        import memory_server
+        import uuid as _uuid
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["James advises Cellbridge Therapeutics."],
+                triples=[
+                    KnowledgeTriple(
+                        subject="James",
+                        predicate="IS",
+                        object="Advisor To Cellbridge Therapeutics",
+                    )
+                ],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "chunk for migration"})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        contained_id = str(_uuid.uuid4())
+        now = datetime.now().isoformat()
+        cursor.execute(
+            "INSERT OR IGNORE INTO entities "
+            "(id, canonical_name, aliases, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Cellbridge Therapeutics', '[]', 0, ?, ?)",
+            (contained_id, now, now),
+        )
+        memory_server.sqlite_conn.commit()
+
+        cursor.execute(
+            "SELECT id FROM entities WHERE LOWER(canonical_name) = LOWER(?)",
+            ("Advisor To Cellbridge Therapeutics",),
+        )
+        compound_row = cursor.fetchone()
+        assert compound_row, "compound entity must exist"
+        compound_id = compound_row[0]
+
+        cursor.execute(
+            "SELECT COUNT(*) FROM entity_chunks WHERE entity_id = ?", (compound_id,)
+        )
+        assert cursor.fetchone()[0] > 0, "compound entity should have entity_chunks rows before consolidation"
+
+        monkeypatch.setattr(
+            "memory_server.librarian_resolve_compound_entity",
+            lambda compound, contained: CompoundEntityDecision(
+                action="rewrite", suggested_predicate="IS_ADVISOR_TO"
+            ),
+        )
+        self._stub_all_other_phases(monkeypatch)
+        app_client.post("/memory/consolidate")
+
+        cursor.execute(
+            "SELECT COUNT(*) FROM entity_chunks WHERE entity_id = ?", (contained_id,)
+        )
+        assert cursor.fetchone()[0] >= 1, "contained entity should inherit entity_chunks rows"
+
+    def test_phase5_no_candidates(self, app_client, monkeypatch):
+        """Phase 5 is a no-op when no entity name is a length+3 substring of another."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=["Alice owns a bakery."],
+                triples=[KnowledgeTriple(subject="Alice", predicate="OWNS", object="Bakery")],
+            ),
+        )
+        app_client.post("/memory/add", json={"text": "only"})
+
+        resolve_calls = [0]
+
+        def counting_resolver(compound, contained):
+            resolve_calls[0] += 1
+            return CompoundEntityDecision(action="keep")
+
+        monkeypatch.setattr("memory_server.librarian_resolve_compound_entity", counting_resolver)
+        self._stub_all_other_phases(monkeypatch)
+        app_client.post("/memory/consolidate")
+
+        assert resolve_calls[0] == 0, "resolver should not be called when no candidates pass the filter"
+
+
+# ---------------------------------------------------------------------------
+# POST /memory/temporal/chain
+# ---------------------------------------------------------------------------
+
+class TestTemporalChain:
+    """Tests for POST /memory/temporal/chain endpoint."""
+
+    def _seed_fact(self, app_client, monkeypatch, fact_text: str, fact_status: str = "current") -> str:
+        """Seed a single fact via /memory/add and return its fact_id."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text: MemoryProcessing(
+                atomic_facts=[AtomicFact(text=fact_text, temporal_status=fact_status)],
+                triples=[],
+            ),
+        )
+        resp = app_client.post("/memory/add", json={"text": fact_text})
+        wait_for_task(app_client, resp.json()["task_id"])
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT id FROM atomic_facts WHERE content = ?", (fact_text,))
+        row = cursor.fetchone()
+        assert row, f"fact '{fact_text}' was not inserted"
+        return row[0]
+
+    def test_chain_by_fact_id(self, app_client, monkeypatch):
+        """Returns an ordered hop chain when queried by fact_id."""
+        import memory_server
+
+        a_id = self._seed_fact(app_client, monkeypatch, "Alice is a doctor.", "current")
+        b_id = self._seed_fact(app_client, monkeypatch, "Alice was a nurse.", "historical")
+        c_id = self._seed_fact(app_client, monkeypatch, "Alice was a student.", "historical")
+
+        tg = memory_server.temporal_graph
+        tg.add_relationship(a_id, "PRECEDED_BY", b_id,
+                            subject_name="Alice is a doctor.",
+                            object_name="Alice was a nurse.",
+                            fact_ids=[b_id], persist=False)
+        tg.add_relationship(b_id, "PRECEDED_BY", c_id,
+                            subject_name="Alice was a nurse.",
+                            object_name="Alice was a student.",
+                            fact_ids=[c_id], persist=False)
+
+        resp = app_client.post("/memory/temporal/chain", json={"fact_id": a_id})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["root_fact"]["id"] == a_id
+        assert body["root_fact"]["text"] == "Alice is a doctor."
+        chain = body["chain"]
+        assert len(chain) == 2
+        assert chain[0]["hop"] == 1
+        assert chain[0]["text"] == "Alice was a nurse."
+        assert chain[1]["hop"] == 2
+        assert chain[1]["text"] == "Alice was a student."
+
+    def test_chain_by_query(self, app_client, monkeypatch):
+        """Finds root fact via ChromaDB top-1 when only query is provided."""
+        import memory_server
+
+        a_id = self._seed_fact(app_client, monkeypatch, "Alice is a doctor.", "current")
+        b_id = self._seed_fact(app_client, monkeypatch, "Alice was a nurse.", "historical")
+
+        tg = memory_server.temporal_graph
+        tg.add_relationship(a_id, "PRECEDED_BY", b_id,
+                            subject_name="Alice is a doctor.",
+                            object_name="Alice was a nurse.",
+                            fact_ids=[b_id], persist=False)
+
+        resp = app_client.post("/memory/temporal/chain", json={"query": "Alice job"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "root_fact" in body
+        assert "chain" in body
+        # With uniform stub embeddings the endpoint prefers current facts as root.
+        assert body["root_fact"]["temporal_status"] == "current"
+
+    def test_chain_includes_concurrent_with(self, app_client, monkeypatch):
+        """Each chain entry includes concurrent_with facts from the temporal graph."""
+        import memory_server
+
+        a_id = self._seed_fact(app_client, monkeypatch, "Alice is a doctor.", "current")
+        b_id = self._seed_fact(app_client, monkeypatch, "Alice was a nurse.", "historical")
+        c_id = self._seed_fact(app_client, monkeypatch, "Alice lived in Seattle.", "historical")
+
+        tg = memory_server.temporal_graph
+        tg.add_relationship(a_id, "PRECEDED_BY", b_id,
+                            subject_name="Alice is a doctor.",
+                            object_name="Alice was a nurse.",
+                            fact_ids=[b_id], persist=False)
+        tg.add_relationship(b_id, "CONCURRENT_WITH", c_id,
+                            subject_name="Alice was a nurse.",
+                            object_name="Alice lived in Seattle.",
+                            fact_ids=[c_id], persist=False)
+
+        resp = app_client.post("/memory/temporal/chain", json={"fact_id": a_id})
+        assert resp.status_code == 200
+        chain = resp.json()["chain"]
+        assert len(chain) == 1
+        concurrent_texts = [e["text"] for e in chain[0]["concurrent_with"]]
+        assert "Alice lived in Seattle." in concurrent_texts
+
+    def test_chain_max_depth_truncates(self, app_client, monkeypatch):
+        """max_depth=1 returns only the direct predecessor."""
+        import memory_server
+
+        a_id = self._seed_fact(app_client, monkeypatch, "Alice is a doctor.", "current")
+        b_id = self._seed_fact(app_client, monkeypatch, "Alice was a nurse.", "historical")
+        c_id = self._seed_fact(app_client, monkeypatch, "Alice was a student.", "historical")
+
+        tg = memory_server.temporal_graph
+        tg.add_relationship(a_id, "PRECEDED_BY", b_id,
+                            subject_name="Alice is a doctor.",
+                            object_name="Alice was a nurse.",
+                            fact_ids=[b_id], persist=False)
+        tg.add_relationship(b_id, "PRECEDED_BY", c_id,
+                            subject_name="Alice was a nurse.",
+                            object_name="Alice was a student.",
+                            fact_ids=[c_id], persist=False)
+
+        resp = app_client.post("/memory/temporal/chain", json={"fact_id": a_id, "max_depth": 1})
+        assert resp.status_code == 200
+        chain = resp.json()["chain"]
+        assert len(chain) == 1
+        assert chain[0]["hop"] == 1
+
+    def test_chain_root_has_no_history(self, app_client, monkeypatch):
+        """Returns root_fact and empty chain when fact has no predecessors."""
+        a_id = self._seed_fact(app_client, monkeypatch, "Alice is a doctor.", "current")
+
+        resp = app_client.post("/memory/temporal/chain", json={"fact_id": a_id})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["root_fact"]["id"] == a_id
+        assert body["chain"] == []
+
+    def test_chain_neither_param_returns_422(self, app_client, monkeypatch):
+        """Returns 422 when neither fact_id nor query is provided."""
+        resp = app_client.post("/memory/temporal/chain", json={})
+        assert resp.status_code == 422
