@@ -17,8 +17,7 @@ Commands inside the loop:
     clear                        Wipe all memory (asks for confirmation)
     help                         Show this message
     exit / quit                  Exit
-
-Requires: pip install requests
+    
 """
 
 import argparse
@@ -35,7 +34,8 @@ import requests
 # ---------------------------------------------------------------------------
 
 BASE_URL = "http://localhost:8000"
-POLL_INTERVAL = 0.5  # seconds between task-status polls
+POLL_INTERVAL = 5.0   # seconds between HTTP task-status requests
+SPINNER_INTERVAL = 0.2  # seconds between visual spinner updates
 
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
@@ -79,18 +79,27 @@ def _delete(path: str) -> dict:
 
 
 def _wait_for_task(task_id: str, label: str = "Working") -> dict:
-    """Poll GET /memory/task/{task_id} until complete, showing a spinner."""
+    """Poll GET /memory/task/{task_id} until complete, showing a spinner.
+
+    HTTP requests are made every POLL_INTERVAL seconds; the spinner updates
+    every SPINNER_INTERVAL seconds so the server log isn't flooded.
+    """
     spinner = ["|", "/", "-", "\\"]
-    i = 0
+    tick = 0
+    last_poll = 0.0
+    data: dict = {}
     while True:
-        data = _get(f"/memory/task/{task_id}")
-        status = data.get("status")
-        if status in ("completed", "failed"):
-            print(f"\r{label}... done.     ")
-            return data
-        print(f"\r{label}... {spinner[i % 4]}", end="", flush=True)
-        i += 1
-        time.sleep(POLL_INTERVAL)
+        now = time.monotonic()
+        if now - last_poll >= POLL_INTERVAL:
+            data = _get(f"/memory/task/{task_id}")
+            last_poll = now
+            status = data.get("status")
+            if status in ("completed", "failed"):
+                print(f"\r{label}... done.     ")
+                return data
+        print(f"\r{label}... {spinner[tick % 4]}", end="", flush=True)
+        tick += 1
+        time.sleep(SPINNER_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
@@ -242,11 +251,11 @@ def all_records(record_type: str | None = None) -> None:
     params = {}
     if record_type:
         params["type"] = record_type
-    data = _get("/memory/all", params=params)
-    if not data:
+    records = _get("/memory/all", params=params).get("results", [])
+    if not records:
         print("  (empty)")
         return
-    shown = data[:50]
+    shown = records[:50]
     for r in shown:
         rtype = r.get("record_type", "?")
         text = r.get("text") or r.get("canonical_name") or "?"
@@ -256,8 +265,8 @@ def all_records(record_type: str | None = None) -> None:
         groups = r.get("groups", [])
         group_str = f" ({', '.join(groups)})" if groups else ""
         print(f"  [{rtype:>6}] {status_str}[{hits:>3} hits]{group_str}  {text[:100]}")
-    if len(data) > 50:
-        print(f"  ... and {len(data) - 50} more.")
+    if len(records) > 50:
+        print(f"  ... and {len(records) - 50} more.")
 
 
 def clear_memory() -> None:
