@@ -93,6 +93,18 @@ class CompoundEntityDecision(BaseModel):
     )
     explanation: str = Field(default="", description="Brief explanation of the decision.")
 
+class EntityMergeDecision(BaseModel):
+    should_merge: bool
+    canonical_to_keep: str = Field(
+        default="",
+        description="The canonical entity name to keep (usually the longer, more complete form). Empty if should_merge is False."
+    )
+    explanation: str = Field(default="", description="Brief explanation of the decision.")
+
+class EntityClassification(BaseModel):
+    entity_type: Literal["person", "organization", "location", "concept", "role", "junk"]
+    reasoning: str = Field(default="", description="Brief reasoning for the classification.")
+
 class ContextHint(BaseModel):
     subject: str | None = Field(
         default=None,
@@ -131,7 +143,9 @@ def process_memory_chunk(text: str, known_entities: list[str] | None = None) -> 
         "{\"text\": \"Alice loves the cat.\", \"temporal_status\": \"current\"}] "
         "Never output a fact containing 'she', 'he', 'it', 'they', 'her', 'him', 'them'. "
         "Set temporal_status to 'historical' for facts stated in past tense or described as no longer true "
-        "(e.g., 'She used to be a fencer', 'He was a teacher in 2010'). "
+        "(e.g., 'She used to be a fencer', 'He was a teacher in 2010', 'Alice joined X in 2013'). "
+        "Any fact that contains a specific past year (e.g. 'in 2013', 'from 2008 to 2012') describing a "
+        "completed event (joined, left, moved, graduated, founded) must be 'historical'. "
         "Set temporal_status to 'current' for present-tense or timeless facts. "
         "Set temporal_status to 'uncertain' only when the temporal state is genuinely ambiguous. "
         "Set valid_period to a short phrase when a time window is mentioned (e.g., 'during college', '2010–2015'); "
@@ -139,12 +153,31 @@ def process_memory_chunk(text: str, known_entities: list[str] | None = None) -> 
         "IMPORTANT: If the text begins with a '[CONTEXT: ...]' line, use it only to resolve pronouns and infer "
         "temporal context — never emit it as a fact itself.\n"
         "2. Extract 'triples': Subject-predicate-object relationships from the text. "
-        "Use past-tense predicates (WAS, HAD) for historical facts and present-tense (IS, HAS) for current ones. "
-        "IMPORTANT: Triple objects must be simple, atomic entity names — never compound role-description strings. "
+        "RULE A — TRIPLE OBJECTS must be reusable named entities only. Never use as an object:\n"
+        "  - Boolean strings (True, False, Yes, No) — omit the triple; the fact already captures it.\n"
+        "  - Year strings (2020, 2013, etc.) — omit the triple; put the year in valid_period instead.\n"
+        "  - Multi-word occupation/role strings like 'High School Art Teacher In San Francisco' "
+        "— use a short generic role ('Teacher') or encode the organization as the object instead.\n"
+        "RULE B — SHORT PREDICATES, max 3 words. Never pack full facts or qualifiers into predicates. "
+        "BAD: FORMED_CLOSE_WORKING_FRIENDSHIP_WITH → GOOD: FRIENDS_WITH. "
+        "BAD: IS_RESEARCH_ASSOCIATE_AT → GOOD: WORKED_AT. "
+        "BAD: WORKED_PART_TIME_AT → GOOD: WORKED_AT. "
+        "BAD: IS_CURRENTLY or IS_NOW → GOOD: IS. "
+        "Never prefix a predicate with FORMERLY_ or IS_NOW_ — use WAS/IS instead.\n"
+        "RULE C — PAST-TENSE PREDICATES for historical facts. "
+        "If a fact's temporal_status is 'historical', its predicate must use WAS, HAD, or another "
+        "past form (WORKED_AT for a past job is fine). Never use IS_CURRENTLY for a historical fact.\n"
         "If a sentence says someone holds a role AT or FOR another entity, encode the role in the predicate "
         "and use the other entity as the object. "
         "BAD: (James, IS, Advisor To Cellbridge Therapeutics). "
-        "GOOD: (James, IS_ADVISOR_TO, Cellbridge Therapeutics)."
+        "GOOD: (James, IS_ADVISOR_TO, Cellbridge Therapeutics).\n"
+        "RULE D — OBJECTS MUST BE PROPER NOUNS: named persons, organizations, or locations only. "
+        "Abstract noun phrases describing feelings, activities, relationships, or time periods are NOT valid objects "
+        "(e.g. 'Close Working Friendship With', 'Her Love Of Community Spaces', "
+        "'The Stories Her Grandmother Told Her', 'Most Of The Period From 2013 To 2017'). "
+        "If no proper-noun object exists for a relationship, omit the triple — the atomic fact captures it.\n"
+        "RULE E — ONE PERSON PER OBJECT: never list multiple people in a single object string "
+        "(e.g. 'James And Ruth Mercer, And Tom'). Create one triple per person, or omit if not meaningful."
         + entity_hint +
         " For each triple, set supporting_fact_indices to the zero-based index (or indices) of the atomic_facts "
         "entry that directly states the information in that triple. "
@@ -300,22 +333,39 @@ def librarian_check_concurrency(
         return None
 
 
-def librarian_assign_groups(entity_name: str, existing_groups: list[str]) -> GroupAssignment | None:
+def librarian_assign_groups(
+    entity_name: str,
+    existing_groups: list[str],
+    context_facts: list[str] | None = None,
+) -> GroupAssignment | None:
     """Decides which thematic groups an entity belongs to.
 
-    Returns matching existing groups and optionally a new group name when none of the existing
-    groups fit. The Librarian should prefer reusing existing groups over creating new ones.
+    context_facts: up to 3 atomic facts mentioning this entity, so the model can see
+    what kind of entity it is rather than guessing from the name alone.
     """
     groups_list = ", ".join(f'"{g}"' for g in existing_groups) if existing_groups else "none yet"
+    facts_block = ""
+    if context_facts:
+        quoted = "\n".join(f'  - "{f}"' for f in context_facts[:3])
+        facts_block = f"\nFacts about this entity:\n{quoted}"
     system_prompt = (
         "You are a memory organizer. Given an entity name and a list of existing thematic groups, "
-        "decide which groups this entity belongs to. Groups are broad thematic categories like "
-        "'Family', 'Friends', 'Colleagues', 'Locations', 'Organizations', 'Hobbies', 'Pets', etc.\n\n"
+        "decide which groups this entity belongs to.\n\n"
+        "Curated group vocabulary (prefer these before creating new ones):\n"
+        "Family, Friends, Colleagues, Locations, Organizations, Hobbies, Pets, Education\n\n"
         "Rules:\n"
+        "- First check: if the entity is a field of study, occupation title, boolean, year, "
+        "or abstract concept — return matching_groups=[] and new_group=null. "
+        "Do NOT assign groups to non-person, non-organization, non-location entities.\n"
         "- Prefer matching existing groups over creating new ones.\n"
-        "- Only set new_group if no existing group fits and the entity clearly warrants one.\n"
-        "- Inanimate objects or abstract concepts that don't fit any category should return empty lists.\n"
-        "- An entity can match multiple groups (e.g., a person who is both a friend and a colleague)."
+        "- Only set new_group if no existing group fits AND the entity is a specific person "
+        "or named organization. new_group must be a short 1-2 word label, not a phrase. "
+        "NEVER use underscores or long descriptive names for new_group.\n"
+        "- An entity can match multiple groups (e.g., a person who is both a friend and a colleague).\n"
+        "- Use the 'Facts about this entity' section (if provided) to determine what kind of entity it is. "
+        "Do NOT let facts from the surrounding document bleed into the group assignment for this entity.\n"
+        "- IMPORTANT: set new_group to null (JSON null, NOT the string 'null', 'Empty_List', '[]', or 'N/A') "
+        "when no new group is needed. Never return a string where null is expected."
     )
     try:
         output_str = get_llm_client().chat_json(
@@ -324,7 +374,7 @@ def librarian_assign_groups(entity_name: str, existing_groups: list[str]) -> Gro
                 {
                     "role": "user",
                     "content": (
-                        f'Entity: "{entity_name}"\n'
+                        f'Entity: "{entity_name}"{facts_block}\n'
                         f"Existing groups: [{groups_list}]\n"
                         "Which groups does this entity belong to?"
                     ),
@@ -380,6 +430,98 @@ def librarian_resolve_compound_entity(compound_name: str, contained_name: str) -
         return CompoundEntityDecision(**json.loads(output_str))
     except Exception as e:
         print(f"[LIBRARIAN ERROR] Compound entity resolution failed: {e}")
+        return None
+
+
+def librarian_should_merge_entities(
+    name_a: str,
+    name_b: str,
+    facts_a: list[str],
+    facts_b: list[str],
+) -> EntityMergeDecision | None:
+    """Decides whether two entity nodes refer to the same real-world entity.
+
+    Typically called when name_a is a token-subset of name_b (e.g. 'Alice' inside
+    'Alice Mercer'), which strongly suggests they are the same person written with
+    different levels of specificity across chunks.
+    """
+    facts_a_str = "\n".join(f"  - {f}" for f in facts_a[:5]) if facts_a else "  (none)"
+    facts_b_str = "\n".join(f"  - {f}" for f in facts_b[:5]) if facts_b else "  (none)"
+    system_prompt = (
+        "You are a knowledge graph deduplicator. Two entity nodes may refer to the same "
+        "real-world person or organization. Name A appears to be a shorter form of Name B "
+        "(all of A's name tokens appear in B's name).\n\n"
+        "Decide:\n"
+        "- should_merge=true if they refer to the same entity (e.g. 'Alice' and 'Alice Mercer' "
+        "when the facts are about the same person).\n"
+        "- should_merge=false if they are clearly different entities "
+        "(e.g. 'Alice' as a city vs 'Alice Mercer' as a person, or different people with the same first name).\n"
+        "- canonical_to_keep: the more complete name (usually Name B, the longer one).\n"
+        "When in doubt and the facts do not contradict each other, prefer should_merge=true "
+        "to avoid fragmentation.\n\n"
+        "KEY SIGNAL — SHARED RELATIONSHIPS: If one entity's facts describe a relationship with a third party "
+        "(e.g. 'Alice's partner is Jordan Kim') and the other's facts describe the same relationship with that "
+        "same party ('Alice Mercer and Jordan have been together since 2016'), this is near-certain evidence they "
+        "are the same entity. Return should_merge=true when you see this pattern."
+    )
+    # Surface any shared third-party names to make the cross-reference signal explicit.
+    tokens_a = {w.lower() for f in facts_a for w in f.split() if len(w) > 3}
+    tokens_b = {w.lower() for f in facts_b for w in f.split() if len(w) > 3}
+    shared = tokens_a & tokens_b - {name_a.lower(), name_b.lower()}
+    shared_note = (
+        f"\nNote: both entities appear in facts that mention the following names/words: {', '.join(sorted(shared)[:10])}"
+        if shared else ""
+    )
+    user_content = (
+        f'Name A: "{name_a}"\nFacts about A:\n{facts_a_str}\n\n'
+        f'Name B: "{name_b}"\nFacts about B:\n{facts_b_str}{shared_note}'
+    )
+    try:
+        output_str = get_llm_client().chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            schema=EntityMergeDecision.model_json_schema(),
+            temperature=0.1,
+        )
+        return EntityMergeDecision(**json.loads(output_str))
+    except Exception as e:
+        print(f"[LIBRARIAN ERROR] Entity merge check failed: {e}")
+        return None
+
+
+def librarian_classify_entity(name: str, backing_facts: list[str]) -> EntityClassification | None:
+    """Classifies whether an entity node is a real named entity or structural junk.
+
+    Used by Phase 7 to flag role strings, abstract concepts, and other non-entities
+    that crept into the knowledge graph as object nodes.
+    """
+    facts_str = "\n".join(f"  - {f}" for f in backing_facts[:5]) if backing_facts else "  (none)"
+    system_prompt = (
+        "You are a knowledge graph auditor. An entity node exists in the graph with the given name. "
+        "Classify what kind of thing it is:\n"
+        "- 'person': a named human (first+last name or title+name)\n"
+        "- 'organization': a company, institution, or group\n"
+        "- 'location': a place, city, region, or country\n"
+        "- 'concept': an academic field, abstract idea, or named domain\n"
+        "- 'role': a job title or role description (e.g. 'Chief Science Officer', 'High School Art Teacher')\n"
+        "- 'junk': a boolean (True/False), year number, or meaningless fragment\n\n"
+        "Use the backing facts to inform your decision."
+    )
+    user_content = f'Entity name: "{name}"\nBacking facts:\n{facts_str}'
+    try:
+        output_str = get_llm_client().chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            schema=EntityClassification.model_json_schema(),
+            temperature=0.1,
+        )
+        return EntityClassification(**json.loads(output_str))
+    except Exception as e:
+        print(f"[LIBRARIAN ERROR] Entity classification failed: {e}")
         return None
 
 

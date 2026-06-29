@@ -29,6 +29,8 @@ from librarian import (
     librarian_check_concurrency,
     librarian_assign_groups,
     librarian_resolve_compound_entity,
+    librarian_should_merge_entities,
+    librarian_classify_entity,
     ContextHint,
 )
 from knowledge_graph import KnowledgeRelationshipGraph
@@ -77,10 +79,10 @@ def startup_event():
     
     # Load LLM backend (local Qwen or cloud provider per config.json)
     load_llm_client()
-    _migrate_to_v2()
-    _migrate_to_v3()
-    _migrate_to_v4()
-    _migrate_to_v5()
+    #_migrate_to_v2()
+    #_migrate_to_v3()
+    #_migrate_to_v4()
+    #_migrate_to_v5()
 
 def get_embedding(text: str) -> list[float]:
     response = embedder.create_embedding(text)
@@ -277,12 +279,21 @@ def _migrate_to_v5():
 
 # Syntactic-variant collapse only — same-direction, no semantic rewrites.
 _PREDICATE_SYNONYMS: dict[str, str] = {
-    "HAVE":      "HAS",
-    "HAVE_A":    "HAS",
-    "HAS_A":     "HAS",
-    "IS_A":      "IS",
-    "IS_AN":     "IS",
-    "WORKS_FOR": "WORKS_AT",
+    "HAVE":             "HAS",
+    "HAVE_A":           "HAS",
+    "HAS_A":            "HAS",
+    "IS_A":             "IS",
+    "IS_AN":            "IS",
+    "WORKS_FOR":        "WORKS_AT",
+    "FORMERLY_WAS":     "WAS",
+    "FORMERLY_BEEN":    "WAS",
+    "USED_TO_BE":       "WAS",
+    "WAS_PREVIOUSLY":   "WAS",
+    "IS_CURRENTLY":     "IS",
+    "IS_NOW":           "IS",
+    "WORKED_AS":        "WORKED_AT",
+    "FORMERLY_WORKED_AT": "WORKED_AT",
+    "PARTNER_OF":       "IS_PARTNER_OF",
 }
 
 _ALIAS_STOPWORDS = frozenset({
@@ -445,6 +456,23 @@ SUPERSESSION_KEYWORDS: frozenset[str] = frozenset([
 # Prevents O(n²) LLM calls when many historical facts share a valid_period.
 CONCURRENT_WITH_MAX_PAIRS = 50
 
+# Maximum LLM calls per Phase 6 (entity identity merge) run.
+ENTITY_MERGE_MAX_PAIRS = 30
+
+# Maximum LLM calls per Phase 7 Tier B (entity classification) run.
+ENTITY_CLASSIFY_MAX_CALLS = 20
+
+# Boolean-valued entity names that are structural junk (Phase 7 Tier A).
+_JUNK_ENTITY_NAMES: frozenset[str] = frozenset({"true", "false", "yes", "no", "none", "null"})
+
+# Regex for detecting past-year references in fact text (for temporal reclassification).
+_PAST_YEAR_PATTERN = re.compile(
+    r"\b(joined|left|moved|graduated|founded|co-founded|started|ended|began|married|born|died)"
+    r"[^.]*\b(in|around|by)\s+(?:19|20)\d{2}\b"
+    r"|\bfrom\s+(?:19|20)\d{2}\s+to\s+(?:19|20)\d{2}\b",
+    re.IGNORECASE,
+)
+
 # Retrieval reranking weights (must sum to 1.0).
 # Similarity dominates; popularity rewards frequently-used facts; recency provides a
 # soft freshness preference. Historical/uncertain facts receive a score multiplier < 1.0
@@ -596,6 +624,29 @@ def _entity_appears_in_chunk(canonical: str, chunk_lower: str) -> bool:
     return len(tokens) > 1 and any(tok in chunk_lower for tok in tokens)
 
 
+_INVALID_GROUP_NAMES: frozenset[str] = frozenset(
+    {"empty_list", "null", "none", "[]", "n/a", "na", "no_group", "no group"}
+)
+
+
+def _is_valid_group_name(name: str | None) -> bool:
+    """Return True only if name is an acceptable group label.
+
+    Rejects: None, underscore-containing strings (hallucinated compound names
+    like "Pipettes_Bioreactors_And_Digital_Sequences"), strings longer than 30
+    characters, and known schema-confusion literals.
+    """
+    if not name or not name.strip():
+        return False
+    if "_" in name:
+        return False
+    if len(name) > 30:
+        return False
+    if name.strip().lower() in _INVALID_GROUP_NAMES:
+        return False
+    return True
+
+
 def _add_memory_sync(memory: MemoryInput, conn: sqlite3.Connection) -> dict:
     """Synchronous core of /memory/add. Called by the background task runner."""
     now = datetime.now().isoformat()
@@ -695,16 +746,27 @@ def _add_memory_sync(memory: MemoryInput, conn: sqlite3.Connection) -> dict:
             )
             if cursor.fetchone()[0] > 0:
                 continue
-            assignment = librarian_assign_groups(entity_name, existing_groups)
+            # Gather up to 3 atomic facts from chunks that mention this entity,
+            # so the Librarian knows what kind of entity it is rather than guessing.
+            cursor.execute(
+                "SELECT af.content FROM atomic_facts af "
+                "JOIN entity_chunks ec ON af.source_chunk_id = ec.chunk_id "
+                "WHERE ec.entity_id = ? ORDER BY af.created_at ASC LIMIT 3",
+                (entity_id,),
+            )
+            context_facts = [r[0] for r in cursor.fetchall()]
+            assignment = librarian_assign_groups(entity_name, existing_groups, context_facts=context_facts)
             if not assignment:
                 continue
             for group_name in assignment.matching_groups:
+                if not _is_valid_group_name(group_name):
+                    continue
                 group_id = get_or_create_group(group_name, conn=conn)
                 cursor.execute(
                     "INSERT OR IGNORE INTO entity_groups (entity_id, group_id) VALUES (?, ?)",
                     (entity_id, group_id),
                 )
-            if assignment.new_group:
+            if _is_valid_group_name(assignment.new_group):
                 group_id = get_or_create_group(assignment.new_group, conn=conn)
                 cursor.execute(
                     "INSERT OR IGNORE INTO entity_groups (entity_id, group_id) VALUES (?, ?)",
@@ -717,6 +779,17 @@ def _add_memory_sync(memory: MemoryInput, conn: sqlite3.Connection) -> dict:
         "message": f"Added {len(processed_data.atomic_facts)} standalone facts and {len(processed_data.triples)} graph relations.",
         "facts_added": len(processed_data.atomic_facts),
         "triples_added": len(processed_data.triples),
+    }
+
+
+@app.post("/memory/ping")
+def ping_memory_server():
+    """
+    Simple sanity check endpoint that confirms if the server is up and running.
+    """
+    print("[SYSTEM] Ping received. Erebus is running.")
+    return {
+        "status": "success",
     }
 
 
@@ -1135,7 +1208,19 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
     edges whose source list becomes empty. Legacy edges (no source_fact_ids) are left
     in place and cleaned up by the degree=0 orphan sweep at the end of each pass.
     """
-    report = {"pruned": 0, "merged": 0, "split": 0, "superseded": 0, "flagged": [], "errors": [], "resolved_entities": []}
+    report = {
+        "pruned": 0,
+        "merged": 0,
+        "split": 0,
+        "superseded": 0,
+        "reclassified": 0,
+        "predicates_normalized": 0,
+        "merged_entities": [],
+        "cleaned_nodes": [],
+        "flagged": [],
+        "errors": [],
+        "resolved_entities": [],
+    }
     cursor = conn.cursor()
     now = datetime.now().isoformat()
 
@@ -1384,15 +1469,28 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
             "SELECT id, content, valid_period FROM atomic_facts "
             "WHERE temporal_status = 'historical' AND valid_period IS NOT NULL"
         )
-        hist_facts = cursor.fetchall()  # list of (id, content, valid_period)
+        hist_facts_raw = cursor.fetchall()  # list of (id, content, valid_period)
+
+        # Exclude termination-event facts — these mark the END of a period, not
+        # a participant in it. Including them produces semantically wrong CONCURRENT_WITH edges
+        # (e.g. "Alice left NovaStem" being concurrent with "Alice worked at NovaStem").
+        _TERMINATION_RE = re.compile(r"\b(left|ended|until|finished|quit|resigned|departed|stopped)\b", re.IGNORECASE)
+        hist_facts = [
+            row for row in hist_facts_raw
+            if not _TERMINATION_RE.search(row[1])
+        ]
 
         pair_calls = 0
         already_linked: set[frozenset] = set()
         # Pre-populate already_linked with existing CONCURRENT_WITH pairs so we don't
         # re-check pairs confirmed in a previous consolidation pass.
+        concurrent_out_degree: dict[str, int] = {}
         for u, v, edata in temporal_graph.G.edges(data=True):
             if edata.get("relation") == "CONCURRENT_WITH":
                 already_linked.add(frozenset([u, v]))
+                concurrent_out_degree[u] = concurrent_out_degree.get(u, 0) + 1
+
+        _CONCURRENT_WITH_MAX_DEGREE = 5  # max outgoing CONCURRENT_WITH edges per fact
 
         for i in range(len(hist_facts)):
             if pair_calls >= CONCURRENT_WITH_MAX_PAIRS:
@@ -1401,11 +1499,16 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
                     "pairs; remaining pairs deferred to next pass."
                 )
                 break
+            id_a = hist_facts[i][0]
+            if concurrent_out_degree.get(id_a, 0) >= _CONCURRENT_WITH_MAX_DEGREE:
+                continue  # this fact already has enough CONCURRENT_WITH edges
             for j in range(i + 1, len(hist_facts)):
                 if pair_calls >= CONCURRENT_WITH_MAX_PAIRS:
                     break
                 id_a, content_a, period_a = hist_facts[i]
                 id_b, content_b, period_b = hist_facts[j]
+                if concurrent_out_degree.get(id_b, 0) >= _CONCURRENT_WITH_MAX_DEGREE:
+                    continue
                 pair_key = frozenset([id_a, id_b])
                 if pair_key in already_linked:
                     continue
@@ -1425,6 +1528,8 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
                     fact_ids=[id_a], persist=False,
                 )
                 already_linked.add(pair_key)
+                concurrent_out_degree[id_a] = concurrent_out_degree.get(id_a, 0) + 1
+                concurrent_out_degree[id_b] = concurrent_out_degree.get(id_b, 0) + 1
                 print(
                     f"[CONSOLIDATE] Concurrent: '{content_a[:60]}' ↔ '{content_b[:60]}'"
                 )
@@ -1432,6 +1537,92 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
         if hist_facts:
             conn.commit()
             temporal_graph.write_graph()
+
+        # ------------------------------------------------------------------
+        # Phase 4d: Same-predicate state-change supersession
+        # ------------------------------------------------------------------
+        # For each entity with multiple out-edges sharing the same predicate, detect
+        # current/historical pairs with different objects — a clear state change.
+        # Adds PRECEDED_BY edges in the temporal graph without needing an LLM call.
+        # ------------------------------------------------------------------
+        print("[CONSOLIDATE] Phase 4d: Same-predicate state-change detection...")
+
+        phase4d_count = 0
+        for subject_id in list(knowledge_graph.G.nodes()):
+            # Group out-edges by predicate
+            pred_buckets: dict[str, list[tuple[str, list[str]]]] = {}
+            for _, obj_id, edge_data in knowledge_graph.G.out_edges(subject_id, data=True):
+                pred = edge_data.get("relation", "")
+                fact_ids = edge_data.get("source_fact_ids") or []
+                pred_buckets.setdefault(pred, []).append((obj_id, fact_ids))
+
+            for pred, edges in pred_buckets.items():
+                if len(edges) < 2:
+                    continue
+                current_entries: list[tuple[str, str]] = []   # (fact_id, obj_id)
+                historical_entries: list[tuple[str, str]] = []
+                for obj_id, fact_ids in edges:
+                    for fid in fact_ids:
+                        cursor.execute(
+                            "SELECT temporal_status FROM atomic_facts WHERE id = ?", (fid,)
+                        )
+                        row = cursor.fetchone()
+                        if not row:
+                            continue
+                        if row[0] == "current":
+                            current_entries.append((fid, obj_id))
+                        elif row[0] == "historical":
+                            historical_entries.append((fid, obj_id))
+
+                for curr_fid, curr_obj in current_entries:
+                    for hist_fid, hist_obj in historical_entries:
+                        if curr_obj == hist_obj:
+                            continue  # same object → not a state change
+                        if curr_fid == hist_fid:
+                            continue  # never create a self-loop
+                        pair_key = frozenset([curr_fid, hist_fid])
+                        if pair_key in already_linked:
+                            continue
+                        # Guard: only add if neither node is already connected
+                        if (temporal_graph.G.has_node(curr_fid)
+                                and temporal_graph.G.has_node(hist_fid)
+                                and temporal_graph.G.has_edge(curr_fid, hist_fid)):
+                            already_linked.add(pair_key)
+                            continue
+                        temporal_graph.add_relationship(
+                            curr_fid, "PRECEDED_BY", hist_fid,
+                            subject_name=curr_fid,
+                            object_name=hist_fid,
+                            persist=False,
+                        )
+                        already_linked.add(pair_key)
+                        phase4d_count += 1
+                        report["superseded"] += 1
+
+        if phase4d_count:
+            temporal_graph.write_graph()
+            print(f"[CONSOLIDATE] Phase 4d: Added {phase4d_count} PRECEDED_BY edge(s).")
+
+        # ------------------------------------------------------------------
+        # Temporal reclassification: facts with explicit past-year event patterns
+        # that are wrongly marked 'current'. Heuristic, no LLM.
+        # ------------------------------------------------------------------
+        cursor.execute(
+            "SELECT id, content FROM atomic_facts WHERE temporal_status = 'current'"
+        )
+        to_reclassify = [
+            (fid, content)
+            for fid, content in cursor.fetchall()
+            if _PAST_YEAR_PATTERN.search(content)
+        ]
+        for fid, content in to_reclassify:
+            cursor.execute(
+                "UPDATE atomic_facts SET temporal_status = 'historical' WHERE id = ?", (fid,)
+            )
+            report["reclassified"] += 1
+            print(f"[CONSOLIDATE] Reclassified as historical: '{content[:70]}'")
+        if to_reclassify:
+            conn.commit()
 
         # ------------------------------------------------------------------
         # Phase 0: Exact-text dedup within atomic_facts
@@ -1753,6 +1944,335 @@ def _consolidate_memories_sync(conn: sqlite3.Connection) -> dict:
             break  # one compound resolves to one contained entity per run
 
     if resolved_ids:
+        knowledge_graph.write_graph()
+        conn.commit()
+
+    # ------------------------------------------------------------------
+    # Phase 8: Retroactive predicate normalization (no LLM)
+    # Rewrites FORMERLY_* and IS_CURRENTLY predicates on existing KG edges
+    # that predate the _PREDICATE_SYNONYMS expansion.
+    # ------------------------------------------------------------------
+    print("[CONSOLIDATE] Phase 8: Retroactive predicate normalization...")
+
+    phase8_rewrites = 0
+    edges_to_rewrite: list[tuple[str, str, int, str, dict]] = []
+    for u, v, key, edata in list(knowledge_graph.G.edges(data=True, keys=True)):
+        pred = edata.get("relation", "")
+        if pred.upper().startswith("FORMERLY_") or pred.upper() == "IS_CURRENTLY":
+            edges_to_rewrite.append((u, v, key, pred, edata))
+
+    for u, v, key, old_pred, edata in edges_to_rewrite:
+        is_formerly = old_pred.upper().startswith("FORMERLY_")
+        if is_formerly:
+            stripped = old_pred[len("FORMERLY_"):].upper()
+        else:
+            stripped = old_pred.upper()
+        new_pred = normalize_predicate(stripped)
+        # Update the edge relation in-place
+        knowledge_graph.G[u][v][key]["relation"] = new_pred
+
+        # Only mark backing facts as historical for FORMERLY_* predicates.
+        # IS_CURRENTLY → IS is a present-tense rewrite; its facts stay current.
+        if is_formerly:
+            for fid in edata.get("source_fact_ids") or []:
+                cursor.execute(
+                    "UPDATE atomic_facts SET temporal_status = 'historical' WHERE id = ? AND temporal_status != 'historical'",
+                    (fid,),
+                )
+
+            # If a current IS/HAS out-edge exists from the same subject, add PRECEDED_BY.
+            # Only relevant for FORMERLY_* (these are genuine past-state edges).
+            hist_fact_ids = set(edata.get("source_fact_ids") or [])
+            for _, _, curr_edata in knowledge_graph.G.out_edges(u, data=True):
+                curr_pred = curr_edata.get("relation", "")
+                if curr_pred in ("IS", "HAS"):
+                    for hist_fid in hist_fact_ids:
+                        for curr_fid in curr_edata.get("source_fact_ids") or []:
+                            if curr_fid == hist_fid:
+                                continue  # never create a self-loop
+                            pair_key = frozenset([curr_fid, hist_fid])
+                            if pair_key not in already_linked:
+                                temporal_graph.add_relationship(
+                                    curr_fid, "PRECEDED_BY", hist_fid,
+                                    subject_name=curr_fid,
+                                    object_name=hist_fid,
+                                    persist=False,
+                                )
+                                already_linked.add(pair_key)
+
+        phase8_rewrites += 1
+        print(f"[CONSOLIDATE] Phase 8: '{old_pred}' → '{new_pred}'")
+
+    if phase8_rewrites:
+        knowledge_graph.write_graph()
+        temporal_graph.write_graph()
+        conn.commit()
+    report["predicates_normalized"] = phase8_rewrites
+
+    # ------------------------------------------------------------------
+    # Phase 6: Entity identity merge (runs once, after Phase 5)
+    # Detects entity pairs where one name is a proper token-subset of the
+    # other (e.g. 'Alice' ⊂ 'Alice Mercer') and merges them via LLM.
+    # ------------------------------------------------------------------
+    print("[CONSOLIDATE] Phase 6: Entity identity merge...")
+
+    cursor.execute("SELECT id, canonical_name FROM entities ORDER BY LENGTH(canonical_name) ASC")
+    all_ents: list[tuple[str, str]] = cursor.fetchall()
+    already_merged_ids: set[str] = set()
+    merge_calls = 0
+
+    for i, (id_a, name_a) in enumerate(all_ents):
+        if merge_calls >= ENTITY_MERGE_MAX_PAIRS:
+            break
+        if id_a in already_merged_ids:
+            continue
+        tokens_a = set(name_a.lower().split())
+        for id_b, name_b in all_ents[i + 1:]:
+            if id_b in already_merged_ids:
+                continue
+            if id_a == id_b:
+                continue
+            tokens_b = set(name_b.lower().split())
+            # A must be a strict token-subset of B (every token of A is in B)
+            if not tokens_a or not tokens_a < tokens_b:
+                continue
+            # Skip if the extra tokens in B look like role/title words
+            role_words = {"advisor", "director", "of", "to", "for", "the", "a", "an",
+                          "manager", "chief", "officer", "head", "lead", "associate",
+                          "at", "in", "by", "with", "from"}
+            extra_tokens = tokens_b - tokens_a
+            if extra_tokens and extra_tokens <= role_words:
+                continue  # Likely a Phase 5 compound, not an identity fragment
+            if merge_calls >= ENTITY_MERGE_MAX_PAIRS:
+                break
+
+            # Gather backing facts for each entity
+            cursor.execute(
+                "SELECT af.content FROM atomic_facts af "
+                "JOIN entity_chunks ec ON af.source_chunk_id = ec.chunk_id "
+                "WHERE ec.entity_id = ? LIMIT 5",
+                (id_a,),
+            )
+            facts_a = [r[0] for r in cursor.fetchall()]
+            cursor.execute(
+                "SELECT af.content FROM atomic_facts af "
+                "JOIN entity_chunks ec ON af.source_chunk_id = ec.chunk_id "
+                "WHERE ec.entity_id = ? LIMIT 5",
+                (id_b,),
+            )
+            facts_b = [r[0] for r in cursor.fetchall()]
+
+            # Pre-LLM co-reference detection: if the same relational keyword appears
+            # in both fact sets alongside the same third entity name, this is near-certain
+            # identity (e.g. "Alice's partner is Jordan" + "Alice's partner is Jordan Kim").
+            coreference_keywords = {"partner", "spouse", "husband", "wife", "colleague",
+                                    "friend", "co-founder", "cofounder", "co-worker"}
+            name_a_lower, name_b_lower = name_a.lower(), name_b.lower()
+
+            def _fact_tokens(facts: list[str]) -> set[str]:
+                return {w for f in facts for w in f.lower().split()}
+
+            tokens_facts_a = _fact_tokens(facts_a)
+            tokens_facts_b = _fact_tokens(facts_b)
+            shared_keywords = (tokens_facts_a & coreference_keywords) & (tokens_facts_b & coreference_keywords)
+            # Find any third-entity name that appears in BOTH fact sets
+            shared_names = {
+                w for w in tokens_facts_a & tokens_facts_b
+                if len(w) > 3 and w not in {name_a_lower, name_b_lower}
+                and w not in coreference_keywords
+            }
+            if shared_keywords and shared_names:
+                print(
+                    f"[CONSOLIDATE] Phase 6: Co-reference signal detected for "
+                    f"'{name_a}' / '{name_b}' (keywords={shared_keywords}, "
+                    f"shared_names={shared_names}) — auto-merging"
+                )
+                # Skip LLM, auto-merge using the longer name as canonical
+                class _AutoDecision:
+                    should_merge = True
+                    canonical_to_keep = name_b
+                    explanation = "co-reference: same relational role with shared third entity"
+                decision = _AutoDecision()
+            else:
+                decision = librarian_should_merge_entities(name_a, name_b, facts_a, facts_b)
+            merge_calls += 1
+            if not decision:
+                report["merge_skipped_null"] = report.get("merge_skipped_null", 0) + 1
+                print(f"[CONSOLIDATE] Phase 6: LLM returned null for '{name_a}' / '{name_b}'")
+                continue
+            if not decision.should_merge:
+                report["merge_skipped_false"] = report.get("merge_skipped_false", 0) + 1
+                print(f"[CONSOLIDATE] Phase 6: LLM declined merge '{name_a}' / '{name_b}': {decision.explanation}")
+                continue
+
+            # Determine canonical (keep) and eliminated IDs
+            canonical_name = decision.canonical_to_keep or name_b
+            if canonical_name.lower() == name_a.lower():
+                keep_id, elim_id, keep_name, elim_name = id_a, id_b, name_a, name_b
+            else:
+                keep_id, elim_id, keep_name, elim_name = id_b, id_a, name_b, name_a
+
+            print(
+                f"[CONSOLIDATE] Phase 6: Merging '{elim_name}' → '{keep_name}'"
+            )
+
+            # Redirect KG edges: elim_id → keep_id
+            if knowledge_graph.G.has_node(elim_id):
+                for subj_id, _, key, edata in list(
+                    knowledge_graph.G.in_edges(elim_id, data=True, keys=True)
+                ):
+                    if subj_id == elim_id:
+                        continue
+                    subj_name = knowledge_graph.G.nodes[subj_id].get("name", subj_id)
+                    knowledge_graph.add_relationship(
+                        subj_id, edata.get("relation", "IS_RELATED_TO"), keep_id,
+                        subject_name=subj_name,
+                        object_name=keep_name,
+                        fact_ids=edata.get("source_fact_ids") or None,
+                        persist=False,
+                    )
+                for _, obj_id, key, edata in list(
+                    knowledge_graph.G.out_edges(elim_id, data=True, keys=True)
+                ):
+                    if obj_id == elim_id:
+                        continue
+                    obj_name = knowledge_graph.G.nodes[obj_id].get("name", obj_id)
+                    knowledge_graph.add_relationship(
+                        keep_id, edata.get("relation", "IS_RELATED_TO"), obj_id,
+                        subject_name=keep_name,
+                        object_name=obj_name,
+                        fact_ids=edata.get("source_fact_ids") or None,
+                        persist=False,
+                    )
+                knowledge_graph.remove_entity_node(elim_id, persist=False)
+
+            # Transfer entity_chunks and entity_groups
+            cursor.execute(
+                "INSERT OR IGNORE INTO entity_chunks (entity_id, chunk_id) "
+                "SELECT ?, chunk_id FROM entity_chunks WHERE entity_id = ?",
+                (keep_id, elim_id),
+            )
+            cursor.execute("DELETE FROM entity_chunks WHERE entity_id = ?", (elim_id,))
+            cursor.execute(
+                "INSERT OR IGNORE INTO entity_groups (entity_id, group_id) "
+                "SELECT ?, group_id FROM entity_groups WHERE entity_id = ?",
+                (keep_id, elim_id),
+            )
+            cursor.execute("DELETE FROM entity_groups WHERE entity_id = ?", (elim_id,))
+            cursor.execute("DELETE FROM entities WHERE id = ?", (elim_id,))
+
+            already_merged_ids.add(elim_id)
+            report["merged_entities"].append({
+                "eliminated": elim_name,
+                "canonical": keep_name,
+                "explanation": decision.explanation,
+            })
+            if elim_id == id_a:
+                break  # id_a is gone; no point comparing it to further candidates
+
+    if already_merged_ids:
+        knowledge_graph.write_graph()
+        conn.commit()
+
+    # ------------------------------------------------------------------
+    # Phase 7: Non-entity node cleanup (runs once, after Phase 6)
+    # Removes boolean/year junk nodes (Tier A, no LLM) and classifies
+    # suspected role/abstract nodes (Tier B, LLM).
+    # ------------------------------------------------------------------
+    print("[CONSOLIDATE] Phase 7: Non-entity node cleanup...")
+
+    cursor.execute("SELECT id, canonical_name FROM entities")
+    all_entity_rows: list[tuple[str, str]] = cursor.fetchall()
+
+    tier_a_removed: set[str] = set()
+    for eid, ename in all_entity_rows:
+        name_lower = ename.lower().strip()
+
+        # Tier A1: boolean junk
+        if name_lower in _JUNK_ENTITY_NAMES:
+            if knowledge_graph.G.has_node(eid):
+                knowledge_graph.remove_entity_node(eid, persist=False)
+            cursor.execute("DELETE FROM entity_chunks WHERE entity_id = ?", (eid,))
+            cursor.execute("DELETE FROM entity_groups WHERE entity_id = ?", (eid,))
+            cursor.execute("DELETE FROM entities WHERE id = ?", (eid,))
+            tier_a_removed.add(eid)
+            report["cleaned_nodes"].append({"name": ename, "type": "boolean_junk", "reason": "boolean or null value"})
+            print(f"[CONSOLIDATE] Phase 7: Removed boolean/null entity '{ename}'")
+            continue
+
+        # Tier A2: year strings
+        if re.match(r"^\d{4}$", ename.strip()):
+            year_val = ename.strip()
+            if knowledge_graph.G.has_node(eid):
+                # Migrate year to valid_period on backing facts
+                for _, _, edata in list(knowledge_graph.G.in_edges(eid, data=True)):
+                    for fid in edata.get("source_fact_ids") or []:
+                        cursor.execute(
+                            "UPDATE atomic_facts SET valid_period = ? "
+                            "WHERE id = ? AND valid_period IS NULL",
+                            (year_val, fid),
+                        )
+                knowledge_graph.remove_entity_node(eid, persist=False)
+            cursor.execute("DELETE FROM entity_chunks WHERE entity_id = ?", (eid,))
+            cursor.execute("DELETE FROM entity_groups WHERE entity_id = ?", (eid,))
+            cursor.execute("DELETE FROM entities WHERE id = ?", (eid,))
+            tier_a_removed.add(eid)
+            report["cleaned_nodes"].append({"name": ename, "type": "year_junk", "reason": f"year migrated to valid_period"})
+            print(f"[CONSOLIDATE] Phase 7: Removed year entity '{ename}', migrated to valid_period")
+
+    if tier_a_removed:
+        knowledge_graph.write_graph()
+        conn.commit()
+
+    # Tier B: LLM classification for low-hit-count entities with suspicious names
+    cursor.execute(
+        "SELECT id, canonical_name FROM entities WHERE hit_count = 0 AND id NOT IN ({})".format(
+            ",".join("?" * len(tier_a_removed)) if tier_a_removed else "''"
+        ),
+        list(tier_a_removed) if tier_a_removed else [],
+    )
+    tier_b_candidates = cursor.fetchall()
+    tier_b_removed: set[str] = set()
+    classify_calls = 0
+
+    for eid, ename in tier_b_candidates:
+        if classify_calls >= ENTITY_CLASSIFY_MAX_CALLS:
+            break
+        if eid in already_merged_ids or eid in tier_a_removed:
+            continue
+
+        cursor.execute(
+            "SELECT af.content FROM atomic_facts af "
+            "JOIN entity_chunks ec ON af.source_chunk_id = ec.chunk_id "
+            "WHERE ec.entity_id = ? LIMIT 5",
+            (eid,),
+        )
+        backing_facts = [r[0] for r in cursor.fetchall()]
+
+        classification = librarian_classify_entity(ename, backing_facts)
+        classify_calls += 1
+        if not classification:
+            continue
+
+        if classification.entity_type in ("junk",):
+            if knowledge_graph.G.has_node(eid):
+                knowledge_graph.remove_entity_node(eid, persist=False)
+            cursor.execute("DELETE FROM entity_chunks WHERE entity_id = ?", (eid,))
+            cursor.execute("DELETE FROM entity_groups WHERE entity_id = ?", (eid,))
+            cursor.execute("DELETE FROM entities WHERE id = ?", (eid,))
+            tier_b_removed.add(eid)
+            report["cleaned_nodes"].append({"name": ename, "type": "junk", "reason": classification.reasoning})
+            print(f"[CONSOLIDATE] Phase 7: Removed junk entity '{ename}'")
+        elif classification.entity_type == "role":
+            report["flagged"].append({
+                "name": ename,
+                "entity_id": eid,
+                "source": "phase7",
+                "reason": f"role node: {classification.reasoning}",
+            })
+            print(f"[CONSOLIDATE] Phase 7: Flagged role entity '{ename}' for review")
+
+    if tier_b_removed:
         knowledge_graph.write_graph()
         conn.commit()
 

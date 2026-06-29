@@ -1,7 +1,7 @@
 {
   "MUCH_RAM": true,
-  "USE_GPU": false,
-  "LOCAL_MODEL": false,
+  "USE_GPU": true,
+  "LOCAL_MODEL": true,
   
   "GOOGLE": {
     "BASE_URL": "https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -17,6 +17,6 @@
   },
   "OLLAMA": {
     "BASE_URL": "http://localhost:11434/v1",
-    "MODEL_NAME": ""
+    "MODEL_NAME": "gemma4:26b"
   }
 }

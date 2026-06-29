@@ -219,18 +219,30 @@ def consolidate() -> None:
         print(f"  Error: {task.get('error')}")
         return
     report = result.get("report", {})
-    print(f"  pruned:   {report.get('pruned', 0)}")
-    print(f"  merged:   {report.get('merged', 0)}")
-    print(f"  split:    {report.get('split', 0)}")
-    print(f"  superseded: {report.get('superseded', 0)}")
+    print(f"  pruned:              {report.get('pruned', 0)}")
+    print(f"  merged:              {report.get('merged', 0)}")
+    print(f"  split:               {report.get('split', 0)}")
+    print(f"  superseded:          {report.get('superseded', 0)}")
+    print(f"  reclassified:        {report.get('reclassified', 0)}")
+    print(f"  predicates_normed:   {report.get('predicates_normalized', 0)}")
     resolved = report.get("resolved_entities", [])
     if resolved:
         print(f"  resolved: {len(resolved)} compound entity/entities")
         for r in resolved:
             print(f"    {r['compound']}  →[{r['predicate']}]→  {r['contained']}")
+    merged_ents = report.get("merged_entities", [])
+    if merged_ents:
+        print(f"  merged entities: {len(merged_ents)}")
+        for m in merged_ents:
+            print(f"    '{m['eliminated']}' → '{m['canonical']}'")
+    cleaned = report.get("cleaned_nodes", [])
+    if cleaned:
+        print(f"  cleaned nodes: {len(cleaned)}")
+        for c in cleaned:
+            print(f"    [{c['type']}] '{c['name']}'")
     flagged = report.get("flagged", [])
     if flagged:
-        print(f"  flagged:  {len(flagged)} pair(s) for review")
+        print(f"  flagged:  {len(flagged)} item(s) for review")
 
 
 def visualize(flags: list[str]) -> None:

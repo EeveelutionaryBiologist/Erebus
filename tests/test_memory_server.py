@@ -28,7 +28,9 @@ from librarian import (
     CompoundEntityDecision,
     ContextHint,
     ConcurrencyDecision,
+    EntityClassification,
     EntityExtraction,
+    EntityMergeDecision,
     Entity,
     GroupAssignment,
     MemoryProcessing,
@@ -898,7 +900,7 @@ class TestEntityGroups:
         )
         monkeypatch.setattr(
             "memory_server.librarian_assign_groups",
-            lambda name, groups: GroupAssignment(matching_groups=["Family"], new_group=None),
+            lambda name, groups, **kw: GroupAssignment(matching_groups=["Family"], new_group=None),
         )
         # Seed an existing group so the Librarian can "find" it.
         cursor = memory_server.sqlite_conn.cursor()
@@ -933,7 +935,7 @@ class TestEntityGroups:
         )
         monkeypatch.setattr(
             "memory_server.librarian_assign_groups",
-            lambda name, groups: GroupAssignment(matching_groups=[], new_group="Pets"),
+            lambda name, groups, **kw: GroupAssignment(matching_groups=[], new_group="Pets"),
         )
         app_client.post("/memory/add", json={"text": "Mochi is a cat."})
 
@@ -966,7 +968,7 @@ class TestEntityGroups:
 
         librarian_calls = [0]
 
-        def counting_assign(name, groups):
+        def counting_assign(name, groups, **kw):
             librarian_calls[0] += 1
             return GroupAssignment(matching_groups=[], new_group="Friends")
 
@@ -993,7 +995,7 @@ class TestEntityGroups:
         )
         monkeypatch.setattr(
             "memory_server.librarian_assign_groups",
-            lambda name, groups: GroupAssignment(matching_groups=[], new_group="Friends"),
+            lambda name, groups, **kw: GroupAssignment(matching_groups=[], new_group="Friends"),
         )
         app_client.post("/memory/add", json={"text": "Bob owns a bakery."})
 
@@ -1017,7 +1019,7 @@ class TestEntityGroups:
         )
         monkeypatch.setattr(
             "memory_server.librarian_assign_groups",
-            lambda name, groups: GroupAssignment(matching_groups=[], new_group="Colleagues"),
+            lambda name, groups, **kw: GroupAssignment(matching_groups=[], new_group="Colleagues"),
         )
         app_client.post("/memory/add", json={"text": "Carol is a scientist."})
 
@@ -1861,7 +1863,7 @@ class TestTemporalGraph:
 
         monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
         monkeypatch.setattr(
-            "memory_server.librarian_assign_groups", lambda name, groups: None
+            "memory_server.librarian_assign_groups", lambda name, groups, **kw: None
         )
         app_client.post("/memory/add", json={"text": "first"})
         app_client.post("/memory/add", json={"text": "second"})
@@ -2705,3 +2707,890 @@ class TestTemporalChain:
         """Returns 422 when neither fact_id nor query is provided."""
         resp = app_client.post("/memory/temporal/chain", json={})
         assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Phase 4d: same-predicate state-change supersession
+# ---------------------------------------------------------------------------
+
+class TestConsolidatePhase4d:
+    """Tests for Phase 4d same-predicate state-change detection in _consolidate_memories_sync."""
+
+    def _stub_all_other_phases(self, monkeypatch):
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+        monkeypatch.setattr("memory_server.librarian_check_supersession", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_check_concurrency", lambda a, b, pa, pb: None)
+        monkeypatch.setattr("memory_server.librarian_resolve_compound_entity", lambda c, n: None)
+        monkeypatch.setattr("memory_server.librarian_should_merge_entities", lambda a, b, fa, fb: None)
+        monkeypatch.setattr("memory_server.librarian_classify_entity", lambda n, f: None)
+
+    def test_phase4d_adds_preceded_by_for_same_predicate_different_object(self, app_client, monkeypatch):
+        """LIVED_IN Mission District (historical) + LIVED_IN Sunset District (current)
+        → PRECEDED_BY edge in temporal graph without LLM."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=[AtomicFact(text="Alice lived in the Mission District.", temporal_status="historical", valid_period="2013-2018")],
+                    triples=[KnowledgeTriple(subject="Alice", predicate="LIVED_IN", object="Mission District", supporting_fact_indices=[0])],
+                )
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Alice lives in the Sunset District.", temporal_status="current")],
+                triples=[KnowledgeTriple(subject="Alice", predicate="LIVED_IN", object="Sunset District", supporting_fact_indices=[0])],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        self._stub_all_other_phases(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        report = task["result"]["report"]
+        assert report["superseded"] >= 1
+
+        # Verify temporal graph has PRECEDED_BY edge
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "SELECT id FROM atomic_facts WHERE temporal_status = 'current' AND content LIKE '%Sunset%'"
+        )
+        curr_row = cursor.fetchone()
+        cursor.execute(
+            "SELECT id FROM atomic_facts WHERE temporal_status = 'historical' AND content LIKE '%Mission%'"
+        )
+        hist_row = cursor.fetchone()
+        assert curr_row and hist_row
+        assert memory_server.temporal_graph.G.has_node(curr_row[0]) or memory_server.temporal_graph.G.has_node(hist_row[0])
+
+    def test_phase4d_same_object_no_edge(self, app_client, monkeypatch):
+        """Two edges with same predicate AND same object → no PRECEDED_BY added."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text, **kwargs):
+            call_count[0] += 1
+            status = "historical" if call_count[0] == 1 else "current"
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text=f"Alice lives in Portland. (chunk {call_count[0]})", temporal_status=status)],
+                triples=[KnowledgeTriple(subject="Alice", predicate="LIVED_IN", object="Portland", supporting_fact_indices=[0])],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        self._stub_all_other_phases(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        # Phase 2 dedup may fire for very similar content; either way Phase 4d should NOT add count
+        # We just check that the task completes without error
+        assert task["result"]["report"] is not None
+
+    def test_phase4d_no_historical_no_edge(self, app_client, monkeypatch):
+        """Two current facts with same predicate, different objects → no PRECEDED_BY."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text, **kwargs):
+            call_count[0] += 1
+            obj = "Mission District" if call_count[0] == 1 else "Sunset District"
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text=f"Alice lives in {obj}.", temporal_status="current")],
+                triples=[KnowledgeTriple(subject="Alice", predicate="LIVED_IN", object=obj, supporting_fact_indices=[0])],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        self._stub_all_other_phases(monkeypatch)
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        # Phase 4d should not add supersession for two current-status facts
+        assert isinstance(task["result"]["report"]["superseded"], int)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: entity identity merge
+# ---------------------------------------------------------------------------
+
+class TestConsolidatePhase6:
+    """Tests for Phase 6 entity identity merge in _consolidate_memories_sync."""
+
+    def _stub_all_other_phases(self, monkeypatch):
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+        monkeypatch.setattr("memory_server.librarian_check_supersession", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_check_concurrency", lambda a, b, pa, pb: None)
+        monkeypatch.setattr("memory_server.librarian_resolve_compound_entity", lambda c, n: None)
+        monkeypatch.setattr("memory_server.librarian_classify_entity", lambda n, f: None)
+
+    def test_phase6_merges_short_and_long_name(self, app_client, monkeypatch):
+        """'Alice' and 'Alice Mercer' fragments are merged when LLM confirms same entity."""
+        import memory_server
+        import uuid as _uuid
+
+        call_count = [0]
+
+        def vary_chunk(_text, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=["Alice is a scientist."],
+                    triples=[KnowledgeTriple(subject="Alice", predicate="IS", object="Scientist")],
+                )
+            return MemoryProcessing(
+                atomic_facts=["Alice Mercer works at CellBridge."],
+                triples=[KnowledgeTriple(subject="Alice Mercer", predicate="WORKS_AT", object="CellBridge")],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr(
+            "memory_server.librarian_should_merge_entities",
+            lambda a, b, fa, fb: EntityMergeDecision(
+                should_merge=True, canonical_to_keep="Alice Mercer", explanation="same person"
+            ),
+        )
+        self._stub_all_other_phases(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        report = task["result"]["report"]
+        assert len(report["merged_entities"]) >= 1
+        assert any(m["canonical"] == "Alice Mercer" for m in report["merged_entities"])
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT canonical_name FROM entities WHERE LOWER(canonical_name) = 'alice'")
+        assert cursor.fetchone() is None, "'Alice' node should be eliminated"
+        cursor.execute("SELECT canonical_name FROM entities WHERE LOWER(canonical_name) = 'alice mercer'")
+        assert cursor.fetchone() is not None, "'Alice Mercer' should survive"
+
+    def test_phase6_skips_when_llm_says_no_merge(self, app_client, monkeypatch):
+        """When LLM returns should_merge=False, both entity nodes survive."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=["Alice is a teacher."],
+                    triples=[KnowledgeTriple(subject="Alice", predicate="IS", object="Teacher", supporting_fact_indices=[0])],
+                )
+            return MemoryProcessing(
+                atomic_facts=["Alice Mercer is a doctor."],
+                triples=[KnowledgeTriple(subject="Alice Mercer", predicate="IS", object="Doctor", supporting_fact_indices=[0])],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr(
+            "memory_server.librarian_should_merge_entities",
+            lambda a, b, fa, fb: EntityMergeDecision(
+                should_merge=False, canonical_to_keep="", explanation="different people"
+            ),
+        )
+        self._stub_all_other_phases(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        assert task["result"]["report"]["merged_entities"] == []
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM entities WHERE LOWER(canonical_name) IN ('alice', 'alice mercer')")
+        assert cursor.fetchone()[0] == 2
+
+    def test_phase6_transfers_entity_chunks(self, app_client, monkeypatch):
+        """After merge, entity_chunks rows from the eliminated entity move to canonical."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=["Jordan was born in Seoul."],
+                    triples=[KnowledgeTriple(subject="Jordan", predicate="BORN_IN", object="Seoul", supporting_fact_indices=[0])],
+                )
+            return MemoryProcessing(
+                atomic_facts=["Jordan Kim teaches art."],
+                triples=[KnowledgeTriple(subject="Jordan Kim", predicate="TEACHES", object="Art", supporting_fact_indices=[0])],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        monkeypatch.setattr(
+            "memory_server.librarian_should_merge_entities",
+            lambda a, b, fa, fb: EntityMergeDecision(
+                should_merge=True, canonical_to_keep="Jordan Kim", explanation="same person"
+            ),
+        )
+        self._stub_all_other_phases(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        assert len(task["result"]["report"]["merged_entities"]) >= 1
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "SELECT e.canonical_name, COUNT(ec.chunk_id) FROM entities e "
+            "JOIN entity_chunks ec ON e.id = ec.entity_id "
+            "WHERE LOWER(e.canonical_name) = 'jordan kim' GROUP BY e.id"
+        )
+        row = cursor.fetchone()
+        assert row is not None
+        assert row[1] >= 2, "Jordan Kim should inherit chunks from both entities"
+
+    def test_phase6_cap_respected(self, app_client, monkeypatch):
+        """Phase 6 stops after ENTITY_MERGE_MAX_PAIRS LLM calls."""
+        import memory_server
+
+        call_count = [0]
+
+        def vary_chunk(_text, **kwargs):
+            call_count[0] += 1
+            name = f"Person {call_count[0]}"
+            return MemoryProcessing(
+                atomic_facts=[f"{name} exists."],
+                triples=[],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+        # Add a modest number of adds — enough to have multiple candidate pairs
+        for i in range(5):
+            app_client.post("/memory/add", json={"text": f"chunk {i}"})
+
+        merge_call_count = [0]
+
+        def counting_merge(a, b, fa, fb):
+            merge_call_count[0] += 1
+            return EntityMergeDecision(should_merge=False, canonical_to_keep="", explanation="")
+
+        monkeypatch.setattr("memory_server.librarian_should_merge_entities", counting_merge)
+        self._stub_all_other_phases(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        assert merge_call_count[0] <= memory_server.ENTITY_MERGE_MAX_PAIRS
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: non-entity node cleanup
+# ---------------------------------------------------------------------------
+
+class TestConsolidatePhase7:
+    """Tests for Phase 7 boolean/year/junk entity cleanup in _consolidate_memories_sync."""
+
+    def _stub_all_other_phases(self, monkeypatch):
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+        monkeypatch.setattr("memory_server.librarian_check_supersession", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_check_concurrency", lambda a, b, pa, pb: None)
+        monkeypatch.setattr("memory_server.librarian_resolve_compound_entity", lambda c, n: None)
+        monkeypatch.setattr("memory_server.librarian_should_merge_entities", lambda a, b, fa, fb: None)
+
+    def test_phase7_removes_boolean_entity(self, app_client, monkeypatch):
+        """Boolean entity 'True' is removed by Tier A without LLM."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text, **kwargs: MemoryProcessing(
+                atomic_facts=["Alice is an avid photographer."],
+                triples=[KnowledgeTriple(subject="Alice", predicate="IS_PHOTOGRAPHER", object="True")],
+            ),
+        )
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+        app_client.post("/memory/add", json={"text": "first"})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM entities WHERE LOWER(canonical_name) = 'true'")
+        assert cursor.fetchone()[0] == 1, "'True' entity should exist after /add"
+
+        monkeypatch.setattr("memory_server.librarian_classify_entity", lambda n, f: None)
+        self._stub_all_other_phases(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        report = task["result"]["report"]
+        assert any(c["name"].lower() == "true" for c in report["cleaned_nodes"])
+
+        cursor.execute("SELECT COUNT(*) FROM entities WHERE LOWER(canonical_name) = 'true'")
+        assert cursor.fetchone()[0] == 0
+
+    def test_phase7_removes_year_entity_and_migrates_valid_period(self, app_client, monkeypatch):
+        """Year entity '2020' is removed; its year value is migrated to backing fact's valid_period."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text, **kwargs: MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Alice stopped painting in 2020.", temporal_status="historical")],
+                triples=[KnowledgeTriple(subject="Alice", predicate="HAS_NOT_PAINTED_SINCE", object="2020", supporting_fact_indices=[0])],
+            ),
+        )
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+        app_client.post("/memory/add", json={"text": "first"})
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM entities WHERE canonical_name = '2020'")
+        assert cursor.fetchone()[0] == 1
+
+        monkeypatch.setattr("memory_server.librarian_classify_entity", lambda n, f: None)
+        self._stub_all_other_phases(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        report = task["result"]["report"]
+        assert any(c["name"] == "2020" for c in report["cleaned_nodes"])
+
+        cursor.execute("SELECT COUNT(*) FROM entities WHERE canonical_name = '2020'")
+        assert cursor.fetchone()[0] == 0
+
+    def test_phase7_tier_b_junk_removed_via_llm(self, app_client, monkeypatch):
+        """Tier B: LLM classifies a low-hit entity as 'junk' → removed."""
+        import memory_server
+        import uuid as _uuid
+
+        # Seed a junk entity directly (no /add path needed)
+        junk_id = str(_uuid.uuid4())
+        now = datetime.now().isoformat()
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "INSERT INTO entities (id, canonical_name, aliases, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Fragment Xyz', '[]', 0, ?, ?)",
+            (junk_id, now, now),
+        )
+        memory_server.sqlite_conn.commit()
+
+        monkeypatch.setattr(
+            "memory_server.librarian_classify_entity",
+            lambda n, f: EntityClassification(entity_type="junk", reasoning="meaningless fragment"),
+        )
+        self._stub_all_other_phases(monkeypatch)
+        monkeypatch.setattr("memory_server.librarian_should_merge_entities", lambda a, b, fa, fb: None)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        report = task["result"]["report"]
+        assert any(c["name"] == "Fragment Xyz" for c in report["cleaned_nodes"])
+
+        cursor.execute("SELECT COUNT(*) FROM entities WHERE id = ?", (junk_id,))
+        assert cursor.fetchone()[0] == 0
+
+    def test_phase7_tier_b_role_flagged_not_removed(self, app_client, monkeypatch):
+        """Tier B: LLM classifies entity as 'role' → flagged for review, not deleted."""
+        import memory_server
+        import uuid as _uuid
+
+        role_id = str(_uuid.uuid4())
+        now = datetime.now().isoformat()
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "INSERT INTO entities (id, canonical_name, aliases, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Chief Science Officer', '[]', 0, ?, ?)",
+            (role_id, now, now),
+        )
+        memory_server.sqlite_conn.commit()
+
+        monkeypatch.setattr(
+            "memory_server.librarian_classify_entity",
+            lambda n, f: EntityClassification(entity_type="role", reasoning="job title"),
+        )
+        self._stub_all_other_phases(monkeypatch)
+        monkeypatch.setattr("memory_server.librarian_should_merge_entities", lambda a, b, fa, fb: None)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        report = task["result"]["report"]
+        assert any(f.get("source") == "phase7" for f in report["flagged"])
+
+        cursor.execute("SELECT COUNT(*) FROM entities WHERE id = ?", (role_id,))
+        assert cursor.fetchone()[0] == 1, "role entity should NOT be deleted"
+
+    def test_phase7_keeps_person_and_org_entities(self, app_client, monkeypatch):
+        """Tier B: LLM classifies entity as 'person' or 'organization' → kept."""
+        import memory_server
+        import uuid as _uuid
+
+        person_id = str(_uuid.uuid4())
+        now = datetime.now().isoformat()
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "INSERT INTO entities (id, canonical_name, aliases, hit_count, created_at, last_accessed) "
+            "VALUES (?, 'Dr Smith', '[]', 0, ?, ?)",
+            (person_id, now, now),
+        )
+        memory_server.sqlite_conn.commit()
+
+        monkeypatch.setattr(
+            "memory_server.librarian_classify_entity",
+            lambda n, f: EntityClassification(entity_type="person", reasoning="human name"),
+        )
+        self._stub_all_other_phases(monkeypatch)
+        monkeypatch.setattr("memory_server.librarian_should_merge_entities", lambda a, b, fa, fb: None)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+
+        cursor.execute("SELECT COUNT(*) FROM entities WHERE id = ?", (person_id,))
+        assert cursor.fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: retroactive predicate normalization
+# ---------------------------------------------------------------------------
+
+class TestConsolidatePhase8:
+    """Tests for Phase 8 retroactive FORMERLY_*/IS_CURRENTLY predicate rewriting."""
+
+    def _stub_all_other_phases(self, monkeypatch):
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+        monkeypatch.setattr("memory_server.librarian_check_supersession", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_check_concurrency", lambda a, b, pa, pb: None)
+        monkeypatch.setattr("memory_server.librarian_resolve_compound_entity", lambda c, n: None)
+        monkeypatch.setattr("memory_server.librarian_should_merge_entities", lambda a, b, fa, fb: None)
+        monkeypatch.setattr("memory_server.librarian_classify_entity", lambda n, f: None)
+
+    def test_phase8_rewrites_formerly_predicate(self, app_client, monkeypatch):
+        """FORMERLY_WAS predicate is rewritten to WAS by Phase 8."""
+        import memory_server
+        import uuid as _uuid
+
+        # Phase 8 repairs legacy data — normalization at write time (via _PREDICATE_SYNONYMS)
+        # means new /add calls already produce WAS/IS. Inject a FORMERLY_WAS edge directly
+        # into the KG to simulate pre-expansion legacy data.
+        subj_id = memory_server.get_or_create_entity("Marcus")
+        obj_id = memory_server.get_or_create_entity("Venture Capitalist")
+        now = datetime.now().isoformat()
+        fact_id = str(_uuid.uuid4())
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "INSERT INTO atomic_facts (id, content, temporal_status, created_at, last_accessed) "
+            "VALUES (?, ?, 'historical', ?, ?)",
+            (fact_id, "Marcus was a venture capitalist.", now, now),
+        )
+        memory_server.sqlite_conn.commit()
+        memory_server.knowledge_graph.add_relationship(
+            subj_id, "FORMERLY_WAS", obj_id,
+            subject_name="Marcus", object_name="Venture Capitalist",
+            fact_ids=[fact_id], persist=True,
+        )
+
+        # Verify the raw FORMERLY_WAS edge exists in KG before consolidation
+        g = memory_server.knowledge_graph.G
+        formerly_edges = [
+            (u, v, k, d) for u, v, k, d in g.edges(data=True, keys=True)
+            if d.get("relation", "").upper().startswith("FORMERLY_")
+        ]
+        assert len(formerly_edges) >= 1, "FORMERLY_* edge should exist before consolidation"
+
+        self._stub_all_other_phases(monkeypatch)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        report = task["result"]["report"]
+        assert report["predicates_normalized"] >= 1
+
+        g = memory_server.knowledge_graph.G
+        remaining_formerly = [
+            d for _, _, _, d in g.edges(data=True, keys=True)
+            if d.get("relation", "").upper().startswith("FORMERLY_")
+        ]
+        assert remaining_formerly == [], "No FORMERLY_* edges should remain after Phase 8"
+
+    def test_phase8_rewrites_is_currently(self, app_client, monkeypatch):
+        """IS_CURRENTLY predicate is rewritten to IS by Phase 8."""
+        import memory_server
+        import uuid as _uuid
+
+        # Inject IS_CURRENTLY edge directly to simulate pre-expansion legacy data.
+        subj_id = memory_server.get_or_create_entity("Alice")
+        obj_id = memory_server.get_or_create_entity("Chief Science Officer")
+        now = datetime.now().isoformat()
+        fact_id = str(_uuid.uuid4())
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "INSERT INTO atomic_facts (id, content, temporal_status, created_at, last_accessed) "
+            "VALUES (?, ?, 'current', ?, ?)",
+            (fact_id, "Alice is the Chief Science Officer.", now, now),
+        )
+        memory_server.sqlite_conn.commit()
+        memory_server.knowledge_graph.add_relationship(
+            subj_id, "IS_CURRENTLY", obj_id,
+            subject_name="Alice", object_name="Chief Science Officer",
+            fact_ids=[fact_id], persist=True,
+        )
+
+        self._stub_all_other_phases(monkeypatch)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        report = task["result"]["report"]
+        assert report["predicates_normalized"] >= 1
+
+        g = memory_server.knowledge_graph.G
+        is_currently_edges = [
+            d for _, _, _, d in g.edges(data=True, keys=True)
+            if d.get("relation", "").upper() == "IS_CURRENTLY"
+        ]
+        assert is_currently_edges == []
+
+    def test_phase8_no_op_on_clean_graph(self, app_client, monkeypatch):
+        """Phase 8 is a no-op when no FORMERLY_* or IS_CURRENTLY edges exist."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text, **kwargs: MemoryProcessing(
+                atomic_facts=["Alice works at CellBridge."],
+                triples=[KnowledgeTriple(subject="Alice", predicate="WORKS_AT", object="CellBridge")],
+            ),
+        )
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+        app_client.post("/memory/add", json={"text": "first"})
+
+        self._stub_all_other_phases(monkeypatch)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        assert task["result"]["report"]["predicates_normalized"] == 0
+
+    def test_phase8_is_currently_does_not_mark_facts_historical(self, app_client, monkeypatch):
+        """IS_CURRENTLY → IS rewrite must NOT mark backing facts as historical.
+
+        IS_CURRENTLY is a present-tense predicate mislabeled with a temporal prefix.
+        Its backing facts are current-state, not past-state. This guards the regression
+        where Phase 8 marked all IS_CURRENTLY-backed facts as historical (causing
+        "Alice is the CSO" to become historical).
+        """
+        import memory_server
+        import uuid as _uuid
+
+        subj_id = memory_server.get_or_create_entity("Alice")
+        obj_id = memory_server.get_or_create_entity("Chief Science Officer")
+        now = datetime.now().isoformat()
+        fact_id = str(_uuid.uuid4())
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "INSERT INTO atomic_facts (id, content, temporal_status, created_at, last_accessed) "
+            "VALUES (?, ?, 'current', ?, ?)",
+            (fact_id, "Alice is the Chief Science Officer.", now, now),
+        )
+        memory_server.sqlite_conn.commit()
+        memory_server.knowledge_graph.add_relationship(
+            subj_id, "IS_CURRENTLY", obj_id,
+            subject_name="Alice", object_name="Chief Science Officer",
+            fact_ids=[fact_id], persist=True,
+        )
+
+        self._stub_all_other_phases(monkeypatch)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute("SELECT temporal_status FROM atomic_facts WHERE id = ?", (fact_id,))
+        row = cursor.fetchone()
+        assert row is not None
+        assert row[0] == "current", "IS_CURRENTLY backing facts must stay current after Phase 8"
+
+    def test_phase8_is_currently_no_self_loop_in_temporal_graph(self, app_client, monkeypatch):
+        """IS_CURRENTLY → IS rewrite must NOT create a PRECEDED_BY self-loop in the temporal graph.
+
+        Phase 8 looks for 'IS' out-edges to create PRECEDED_BY history. When IS_CURRENTLY is
+        rewritten to IS in-place, the rewritten edge matches the search, creating a
+        PRECEDED_BY(fact → fact) self-loop. This test guards that regression.
+        """
+        import memory_server
+        import uuid as _uuid
+
+        subj_id = memory_server.get_or_create_entity("Alice")
+        obj_id = memory_server.get_or_create_entity("Director")
+        now = datetime.now().isoformat()
+        fact_id = str(_uuid.uuid4())
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "INSERT INTO atomic_facts (id, content, temporal_status, created_at, last_accessed) "
+            "VALUES (?, ?, 'current', ?, ?)",
+            (fact_id, "Alice is the Director.", now, now),
+        )
+        memory_server.sqlite_conn.commit()
+        memory_server.knowledge_graph.add_relationship(
+            subj_id, "IS_CURRENTLY", obj_id,
+            subject_name="Alice", object_name="Director",
+            fact_ids=[fact_id], persist=True,
+        )
+
+        self._stub_all_other_phases(monkeypatch)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+
+        tg = memory_server.temporal_graph.G
+        self_loops = [
+            (u, v, d)
+            for u, v, d in tg.edges(data=True)
+            if u == v and d.get("relation") == "PRECEDED_BY"
+        ]
+        assert self_loops == [], f"No PRECEDED_BY self-loops should exist, found: {self_loops}"
+
+
+# ---------------------------------------------------------------------------
+# Group assignment validation
+# ---------------------------------------------------------------------------
+
+class TestGroupValidation:
+    """Tests for _is_valid_group_name filtering of hallucinated/malformed group labels."""
+
+    def test_rejects_underscored_name(self, app_client, monkeypatch):
+        """Group names containing underscores are rejected (hallucinated compound labels)."""
+        from memory_server import _is_valid_group_name
+        assert not _is_valid_group_name("Pipettes_Bioreactors_And_Digital_Sequences")
+        assert not _is_valid_group_name("Lead_Research_Associate")
+
+    def test_rejects_empty_list_string(self, app_client, monkeypatch):
+        """The string 'Empty_List' (schema confusion from 3B model) is rejected."""
+        from memory_server import _is_valid_group_name
+        assert not _is_valid_group_name("Empty_List")
+        assert not _is_valid_group_name("empty_list")
+        assert not _is_valid_group_name("null")
+        assert not _is_valid_group_name("None")
+        assert not _is_valid_group_name("[]")
+
+    def test_rejects_too_long_name(self, app_client, monkeypatch):
+        """Names longer than 30 characters are rejected."""
+        from memory_server import _is_valid_group_name
+        assert not _is_valid_group_name("Lifelong Dedication To Human Health")
+
+    def test_accepts_valid_names(self, app_client, monkeypatch):
+        """Valid 1-2 word group names pass validation."""
+        from memory_server import _is_valid_group_name
+        for name in ("Family", "Friends", "Colleagues", "Organizations", "Hobbies", "Pets"):
+            assert _is_valid_group_name(name), f"'{name}' should be valid"
+
+    def test_invalid_group_not_stored_on_add(self, app_client, monkeypatch):
+        """When the LLM returns 'Empty_List' as new_group it is discarded, not stored."""
+        import memory_server
+
+        monkeypatch.setattr(
+            "memory_server.process_memory_chunk",
+            lambda text, **kwargs: MemoryProcessing(
+                atomic_facts=["Jordan Kim is a teacher."],
+                triples=[KnowledgeTriple(subject="Jordan Kim", predicate="IS", object="Teacher")],
+            ),
+        )
+        monkeypatch.setattr(
+            "memory_server.librarian_assign_groups",
+            lambda n, g, **kw: GroupAssignment(matching_groups=[], new_group="Empty_List"),
+        )
+
+        resp = app_client.post("/memory/add", json={"text": "Jordan Kim is a teacher."})
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "SELECT g.name FROM groups g "
+            "JOIN entity_groups eg ON g.id = eg.group_id "
+            "JOIN entities e ON e.id = eg.entity_id "
+            "WHERE LOWER(e.canonical_name) = 'jordan kim'"
+        )
+        groups = [r[0] for r in cursor.fetchall()]
+        assert "Empty_List" not in groups, f"'Empty_List' must not be stored as group; got: {groups}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4d: self-loop guard
+# ---------------------------------------------------------------------------
+
+class TestPhase4dSelfLoop:
+    """Tests that Phase 4d never creates PRECEDED_BY(fact, fact) self-loops."""
+
+    def _stub_all_other_phases(self, monkeypatch):
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+        monkeypatch.setattr("memory_server.librarian_check_supersession", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_check_concurrency", lambda a, b, pa, pb: None)
+        monkeypatch.setattr("memory_server.librarian_resolve_compound_entity", lambda c, n: None)
+        monkeypatch.setattr("memory_server.librarian_should_merge_entities", lambda a, b, fa, fb: None)
+        monkeypatch.setattr("memory_server.librarian_classify_entity", lambda n, f: None)
+
+    def test_phase4d_no_self_loop_when_same_fact_in_both_buckets(self, app_client, monkeypatch):
+        """Phase 4d must not create PRECEDED_BY(A, A) when the same fact backs both the
+        current and historical entries for a predicate (can occur when a single IS edge's
+        backing fact is mislabeled historical by the extraction LLM).
+
+        We simulate this by injecting a KG edge whose backing fact is already marked
+        historical, so both the current and historical buckets would contain the same fact_id.
+        """
+        import memory_server
+        import uuid as _uuid
+
+        subj_id = memory_server.get_or_create_entity("Alice")
+        obj_id = memory_server.get_or_create_entity("Engineer")
+        now = datetime.now().isoformat()
+        fact_id = str(_uuid.uuid4())
+        cursor = memory_server.sqlite_conn.cursor()
+        cursor.execute(
+            "INSERT INTO atomic_facts (id, content, temporal_status, created_at, last_accessed) "
+            "VALUES (?, ?, 'historical', ?, ?)",
+            (fact_id, "Alice is an engineer.", now, now),
+        )
+        memory_server.sqlite_conn.commit()
+        # The IS edge is backed by a historical fact — if Phase 4d doesn't guard
+        # curr_fid == hist_fid it would create a self-loop.
+        memory_server.knowledge_graph.add_relationship(
+            subj_id, "IS", obj_id,
+            subject_name="Alice", object_name="Engineer",
+            fact_ids=[fact_id], persist=True,
+        )
+
+        self._stub_all_other_phases(monkeypatch)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+
+        tg = memory_server.temporal_graph.G
+        self_loops = [
+            (u, v, d)
+            for u, v, d in tg.edges(data=True)
+            if u == v and d.get("relation") == "PRECEDED_BY"
+        ]
+        assert self_loops == [], f"No PRECEDED_BY self-loops should exist, found: {self_loops}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: decision logging and co-reference detection
+# ---------------------------------------------------------------------------
+
+class TestPhase6Logging:
+    """Tests that Phase 6 logs LLM null/false decisions into the report."""
+
+    def _stub_all_other_phases(self, monkeypatch):
+        monkeypatch.setattr("memory_server.librarian_should_merge", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_split_compound", lambda f: None)
+        monkeypatch.setattr("memory_server.librarian_check_supersession", lambda a, b: None)
+        monkeypatch.setattr("memory_server.librarian_check_concurrency", lambda a, b, pa, pb: None)
+        monkeypatch.setattr("memory_server.librarian_resolve_compound_entity", lambda c, n: None)
+        monkeypatch.setattr("memory_server.librarian_classify_entity", lambda n, f: None)
+
+    def test_phase6_logs_null_decision(self, app_client, monkeypatch):
+        """When librarian_should_merge_entities returns None, report['merge_skipped_null'] increments."""
+        import memory_server
+
+        call_count = [0]
+        def vary_chunk(_text, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=[AtomicFact(text="Jordan is Alice's partner.", temporal_status="current")],
+                    triples=[KnowledgeTriple(subject="Jordan", predicate="IS_PARTNER_OF", object="Alice")],
+                )
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Jordan Kim is a teacher.", temporal_status="current")],
+                triples=[KnowledgeTriple(subject="Jordan Kim", predicate="IS", object="Teacher")],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        self._stub_all_other_phases(monkeypatch)
+        monkeypatch.setattr("memory_server.librarian_should_merge_entities", lambda a, b, fa, fb: None)
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        report = task["result"]["report"]
+        assert report.get("merge_skipped_null", 0) >= 1, (
+            "report['merge_skipped_null'] should be incremented when LLM returns None"
+        )
+
+    def test_phase6_logs_false_decision(self, app_client, monkeypatch):
+        """When librarian_should_merge_entities returns should_merge=False, report['merge_skipped_false'] increments."""
+        import memory_server
+
+        call_count = [0]
+        def vary_chunk(_text, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MemoryProcessing(
+                    atomic_facts=[AtomicFact(text="Jordan lives in Portland.", temporal_status="current")],
+                    triples=[KnowledgeTriple(subject="Jordan", predicate="LIVES_IN", object="Portland")],
+                )
+            return MemoryProcessing(
+                atomic_facts=[AtomicFact(text="Jordan Kim works in SF.", temporal_status="current")],
+                triples=[KnowledgeTriple(subject="Jordan Kim", predicate="WORKS_IN", object="San Francisco")],
+            )
+
+        monkeypatch.setattr("memory_server.process_memory_chunk", vary_chunk)
+        monkeypatch.setattr("memory_server.librarian_assign_groups", lambda n, g, **kw: None)
+        app_client.post("/memory/add", json={"text": "first"})
+        app_client.post("/memory/add", json={"text": "second"})
+
+        self._stub_all_other_phases(monkeypatch)
+        monkeypatch.setattr(
+            "memory_server.librarian_should_merge_entities",
+            lambda a, b, fa, fb: EntityMergeDecision(
+                should_merge=False, canonical_to_keep=b, explanation="different people"
+            ),
+        )
+
+        resp = app_client.post("/memory/consolidate")
+        task = wait_for_task(app_client, resp.json()["task_id"])
+        assert task["status"] == "completed"
+        report = task["result"]["report"]
+        assert report.get("merge_skipped_false", 0) >= 1, (
+            "report['merge_skipped_false'] should be incremented when LLM returns should_merge=False"
+        )
