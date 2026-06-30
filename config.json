@@ -1,11 +1,15 @@
 {
   "MUCH_RAM": true,
-  "USE_GPU": true,
-  "LOCAL_MODEL": true,
+  "USE_GPU": false,
+  "LOCAL_MODEL": false,
   
   "GOOGLE": {
     "BASE_URL": "https://generativelanguage.googleapis.com/v1beta/openai/",
     "MODEL_NAME": "gemini-3.1-flash-lite"
+  },
+  "DEEPSEEK": {
+    "BASE_URL": "https://api.deepseek.com",
+    "MODEL_NAME": "deepseek-v4-flash"
   },
   "OPENAI": {
     "BASE_URL": "",

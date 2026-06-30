@@ -21,7 +21,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = Path(os.environ.get("EREBUS_CONFIG", BASE_DIR / "config.json"))
 
-_KEYED_PROVIDERS = ["GOOGLE", "OPENAI", "ANTHROPIC"]
+_KEYED_PROVIDERS = ["GOOGLE", "DEEPSEEK", "OPENAI", "ANTHROPIC"]
 
 _client = None
 
